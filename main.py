@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, scrolledtext
 from typing import Callable
 import threading
 import ctypes
+import subprocess
 
 import hotspot_powershell
 import hotspot_python
@@ -101,6 +102,13 @@ class HotspotApp:
             style="Dev.TCheckbutton"
         )
         dev_check.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            row3_frame,
+            text="Abrir Hotspot de Windows",
+            command=self._open_windows_hotspot_settings,
+            width=22
+        ).pack(side=tk.RIGHT, padx=5)
         
         ttk.Button(
             row3_frame,
@@ -247,6 +255,37 @@ class HotspotApp:
                 foreground="orange"
             )
     
+    def _open_windows_hotspot_settings(self):
+        try:
+            # Intento principal: abrir directamente la pagina de Hotspot movil
+            subprocess.run(
+                ["start", "ms-settings:network-mobilehotspot"],
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            self._update_status(
+                "Se ha abierto la configuracion de Hotspot movil de Windows.\n\n"
+                "Activa el interruptor \"Compartir mi conexion a Internet\" para crear el hotspot."
+            )
+        except Exception:
+            try:
+                # Fallback: abrir la seccion general de red
+                subprocess.run(
+                    ["start", "ms-settings:network-status"],
+                    shell=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                self._update_status(
+                    "No se pudo abrir directamente el Hotspot movil.\n"
+                    "Se ha abierto la configuracion de red de Windows.\n\n"
+                    "Desde ahi, ve a \"Hotspot movil\" y activalo manualmente."
+                )
+            except Exception:
+                self._update_status(
+                    "No se pudo abrir la configuracion de Windows.\n\n"
+                    "Abre manualmente: Configuracion > Red e Internet > Hotspot movil."
+                )
+    
     def _get_manager(self):
         method = self.current_method.get()
         if method == "powershell":
@@ -377,12 +416,44 @@ class HotspotApp:
         if self.developer_mode.get():
             error_handler.DebugLogger.enable()
         
-        manager = self._get_manager()
-        method_desc = self._get_method_description()
-        self._update_status(f"Creando hotspot '{ssid}'...\nMetodo: {method_desc}")
-        
         def create():
-            return manager.create_hotspot(ssid, password)
+            métodos = ["mobile", "python", "powershell"]
+            metodo_seleccionado = self.current_method.get()
+            
+            if metodo_seleccionado in métodos:
+                start_index = métodos.index(metodo_seleccionado)
+                orden = métodos[start_index:] + métodos[:start_index]
+            else:
+                orden = métodos
+            
+            mensajes: list[str] = []
+            exito_general = False
+            
+            for metodo in orden:
+                if metodo == "mobile":
+                    manager = hotspot_mobile
+                    descripcion = "Mobile Hotspot (Windows API)"
+                elif metodo == "python":
+                    manager = hotspot_python
+                    descripcion = "Python (netsh)"
+                else:
+                    manager = hotspot_powershell
+                    descripcion = "PowerShell (netsh)"
+                
+                encabezado = f"[METODO: {descripcion}]"
+                mensajes.append(encabezado)
+                
+                ok, msg = manager.create_hotspot(ssid, password)
+                mensajes.append(msg)
+                
+                if ok:
+                    exito_general = True
+                    break
+                else:
+                    mensajes.append("\n--- Intentando siguiente metodo...\n")
+            
+            mensaje_final = f"Creando hotspot '{ssid}' con multiples metodos...\n\n" + "\n\n".join(mensajes)
+            return exito_general, mensaje_final
         
         self._run_async(create)
     

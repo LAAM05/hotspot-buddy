@@ -54,13 +54,28 @@ class WindowsMobileHotspot:
 [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] > $null
 [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] > $null
 
-$asTaskGeneric = (
+Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+
+$winrtExtensionsType = [System.Type]::GetType('System.WindowsRuntimeSystemExtensions, System.Runtime.WindowsRuntime')
+if (-not $winrtExtensionsType) {{
+    Write-Output "ERROR: System.WindowsRuntimeSystemExtensions no disponible. Mobile Hotspot no es compatible con esta version de PowerShell/.NET."
+    return
+}}
+
+$asTaskMethods = (
     [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ 
         $_.Name -eq 'AsTask' -and 
         $_.GetParameters().Count -eq 1 -and 
         $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' 
     }}
-)[0]
+)
+
+if (-not $asTaskMethods -or $asTaskMethods.Count -eq 0) {{
+    Write-Output "ERROR: No se encontro el metodo AsTask para WinRT. Mobile Hotspot no esta disponible."
+    return
+}}
+
+$asTaskGeneric = $asTaskMethods[0]
 
 Function Await-Task($asyncOp, $resultType) {{
     $asTask = $asTaskGeneric.MakeGenericMethod($resultType)
