@@ -385,6 +385,34 @@ class HotspotApp:
         manager = self._get_manager()
         success, message = manager.check_support()
         method_desc = self._get_method_description()
+        
+        if success:
+            self._update_status(f"Verificacion de compatibilidad [{method_desc}]:\n\n{message}")
+            return
+        
+        # Si falla Mobile Hotspot por puente WinRT, cambiamos automaticamente
+        # al primer metodo netsh compatible para no bloquear la app en ese error.
+        if self.current_method.get() == "mobile" and "ERROR_WINRT_BRIDGE" in message:
+            fallback_results: list[str] = [f"Verificacion de compatibilidad [{method_desc}]:\n\n{message}"]
+            
+            for fallback_method, fallback_desc, fallback_manager in [
+                ("python", "Python (netsh)", hotspot_python),
+                ("powershell", "PowerShell (netsh)", hotspot_powershell),
+            ]:
+                ok, fallback_msg = fallback_manager.check_support()
+                fallback_results.append(
+                    f"\n\nVerificacion de compatibilidad [{fallback_desc}]:\n\n{fallback_msg}"
+                )
+                if ok:
+                    self.current_method.set(fallback_method)
+                    fallback_results.append(
+                        f"\n\nSe selecciono automaticamente el metodo [{fallback_desc}] por compatibilidad."
+                    )
+                    break
+            
+            self._update_status("".join(fallback_results))
+            return
+        
         self._update_status(f"Verificacion de compatibilidad [{method_desc}]:\n\n{message}")
     
     def _diagnose(self):

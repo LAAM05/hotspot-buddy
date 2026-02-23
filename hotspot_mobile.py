@@ -53,35 +53,35 @@ class WindowsMobileHotspot:
         full_script = f'''
 [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] > $null
 [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] > $null
+[Windows.Foundation.AsyncStatus,Windows,ContentType=WindowsRuntime] > $null
 
-Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
-
-$winrtExtensionsType = [System.Type]::GetType('System.WindowsRuntimeSystemExtensions, System.Runtime.WindowsRuntime')
-if (-not $winrtExtensionsType) {{
-    Write-Output "ERROR: System.WindowsRuntimeSystemExtensions no disponible. Mobile Hotspot no es compatible con esta version de PowerShell/.NET."
-    return
-}}
-
-$asTaskMethods = (
-    [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ 
-        $_.Name -eq 'AsTask' -and 
-        $_.GetParameters().Count -eq 1 -and 
-        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' 
+Function Await-AsyncOperation($asyncOp) {{
+    $deadline = (Get-Date).AddSeconds(30)
+    while ($true) {{
+        $statusCode = [int]$asyncOp.Status
+        switch ($statusCode) {{
+            0 {{
+                if ((Get-Date) -gt $deadline) {{
+                    throw "Timeout esperando operacion WinRT."
+                }}
+                Start-Sleep -Milliseconds 120
+                continue
+            }}
+            1 {{
+                return $asyncOp.GetResults()
+            }}
+            2 {{
+                throw "Operacion WinRT cancelada."
+            }}
+            3 {{
+                $code = $asyncOp.ErrorCode
+                throw "Operacion WinRT fallo. HRESULT: $code"
+            }}
+            default {{
+                throw "Estado WinRT inesperado: $statusCode"
+            }}
+        }}
     }}
-)
-
-if (-not $asTaskMethods -or $asTaskMethods.Count -eq 0) {{
-    Write-Output "ERROR: No se encontro el metodo AsTask para WinRT. Mobile Hotspot no esta disponible."
-    return
-}}
-
-$asTaskGeneric = $asTaskMethods[0]
-
-Function Await-Task($asyncOp, $resultType) {{
-    $asTask = $asTaskGeneric.MakeGenericMethod($resultType)
-    $netTask = $asTask.Invoke($null, @($asyncOp))
-    $netTask.Wait(-1) > $null
-    return $netTask.Result
 }}
 
 try {{
@@ -143,6 +143,16 @@ Write-Output "CurrentSSID: $($config.Ssid)"
                 result_msg += f"\n\n{full_report}"
             return False, result_msg
         
+        if "ERROR_WINRT_BRIDGE" in msg:
+            result_msg = (
+                "No fue posible usar la API Mobile Hotspot desde PowerShell en este entorno.\n\n"
+                f"{msg}\n\n"
+                "Puedes seguir usando los metodos netsh (Python/PowerShell) o abrir el Hotspot de Windows."
+            )
+            if full_report:
+                result_msg += f"\n\n{full_report}"
+            return False, result_msg
+        
         if "ERROR" in msg:
             result_msg = f"Mobile Hotspot no disponible.\n\n{msg}\n\nIntenta usar Python o PowerShell."
             if full_report:
@@ -183,19 +193,37 @@ $config.Passphrase = "{password}"
 
 try {{
     $configOp = $tethering.ConfigureAccessPointAsync($config)
-    $null = Await-Task $configOp ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration])
+    $null = Await-AsyncOperation $configOp
 }} catch {{
     # Continuar aunque falle la configuracion
 }}
 
 $startOp = $tethering.StartTetheringAsync()
-$result = Await-Task $startOp ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-
-if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {{
-    Write-Output "SUCCESS: Hotspot '{ssid}' iniciado correctamente"
-}} else {{
-    Write-Output "ERROR: $($result.Status) - $($result.AdditionalErrorMessage)"
+$deadline = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadline) {{
+    $state = "$($tethering.TetheringOperationalState)"
+    if ($state -eq "On") {{
+        Write-Output "SUCCESS: Hotspot '{ssid}' iniciado correctamente"
+        return
+    }}
+    Start-Sleep -Milliseconds 300
 }}
+
+try {{
+    if ([int]$startOp.Status -eq 1) {{
+        $result = $startOp.GetResults()
+        if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {{
+            Write-Output "SUCCESS: Hotspot '{ssid}' iniciado correctamente"
+            return
+        }}
+        Write-Output "ERROR: $($result.Status) - $($result.AdditionalErrorMessage)"
+        return
+    }}
+}} catch {{
+    # Ignorar y devolver timeout controlado
+}}
+
+Write-Output "ERROR: Timeout esperando activacion del hotspot"
 '''
         
         success, msg, debug_info = self._run_winrt_ps(script, "START_HOTSPOT")
@@ -211,6 +239,16 @@ if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationSt
             if full_report:
                 result_msg += f"\n\n{full_report}"
             return True, result_msg
+        
+        if "ERROR_WINRT_BRIDGE" in msg:
+            error_msg = (
+                "No se pudo iniciar Mobile Hotspot con la capa WinRT de PowerShell.\n\n"
+                f"{msg}\n\n"
+                "Prueba con el metodo Python/PowerShell (netsh) o con el boton 'Abrir Hotspot de Windows'."
+            )
+            if full_report:
+                error_msg += f"\n\n{full_report}"
+            return False, error_msg
         
         error_msg = f"No se pudo iniciar Mobile Hotspot.\n\n{msg}"
         if full_report:
@@ -231,13 +269,31 @@ if ($profile -eq $null) {
 $tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
 
 $stopOp = $tethering.StopTetheringAsync()
-$result = Await-Task $stopOp ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-
-if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
-    Write-Output "SUCCESS: Hotspot detenido"
-} else {
-    Write-Output "ERROR: $($result.Status)"
+$deadline = (Get-Date).AddSeconds(45)
+while ((Get-Date) -lt $deadline) {
+    $state = "$($tethering.TetheringOperationalState)"
+    if ($state -eq "Off") {
+        Write-Output "SUCCESS: Hotspot detenido"
+        return
+    }
+    Start-Sleep -Milliseconds 300
 }
+
+try {
+    if ([int]$stopOp.Status -eq 1) {
+        $result = $stopOp.GetResults()
+        if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
+            Write-Output "SUCCESS: Hotspot detenido"
+            return
+        }
+        Write-Output "ERROR: $($result.Status)"
+        return
+    }
+} catch {
+    # Ignorar y devolver timeout controlado
+}
+
+Write-Output "ERROR: Timeout esperando apagado del hotspot"
 '''
         
         success, msg, debug_info = self._run_winrt_ps(script, "STOP_HOTSPOT")
