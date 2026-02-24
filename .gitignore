@@ -1,0 +1,6 @@
+.qoder
+.venv
+__pycache__
+Microsoft/
+build/
+dist/
