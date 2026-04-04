@@ -10,34 +10,34 @@ def is_admin() -> bool:
     except:
         return False
 
-def run_command(cmd: str, step: str = "") -> tuple[int, str, str, error_handler.DebugInfo]:
+def run_command(cmd: list, step: str = "") -> tuple[int, str, str, error_handler.DebugInfo]:
+    """Ejecuta un comando como lista (sin shell=True para evitar inyección de comandos)."""
     try:
         result = subprocess.run(
             cmd,
-            shell=True,
             capture_output=True,
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
-            encoding='utf-8',
-            errors='ignore'
+            encoding="utf-8",
+            errors="ignore",
         )
         debug_info = error_handler.DebugLogger.log(
             step=step,
-            command=cmd,
+            command=" ".join(cmd),
             return_code=result.returncode,
             stdout=result.stdout,
-            stderr=result.stderr
+            stderr=result.stderr,
         )
         return result.returncode, result.stdout, result.stderr, debug_info
-    except Exception as e:
+    except Exception as exc:
         debug_info = error_handler.DebugLogger.log(
             step=step,
-            command=cmd,
+            command=" ".join(cmd),
             return_code=-1,
             stdout="",
-            stderr=str(e)
+            stderr=str(exc),
         )
-        return -1, "", str(e), debug_info
+        return -1, "", str(exc), debug_info
 
 class HotspotManager:
     def __init__(self):
@@ -56,12 +56,16 @@ class HotspotManager:
     
     def validate_password(self, password: str) -> tuple[bool, str]:
         if len(password) < 8:
-            return False, "La contrasena debe tener al menos 8 caracteres"
+            return False, "La contraseña debe tener al menos 8 caracteres"
         if len(password) > 63:
-            return False, "La contrasena no puede exceder 63 caracteres"
-        if not re.match(r'^[a-zA-Z0-9]+$', password):
-            return False, "La contrasena solo puede contener letras y numeros"
-        return True, "Contrasena valida"
+            return False, "La contraseña no puede exceder 63 caracteres"
+        # WPA2 permite caracteres ASCII imprimibles (0x20-0x7E) excepto comillas dobles
+        # que romperían el comando netsh. Se permiten especiales como * ! @ # $ etc.
+        if not re.match(r'^[\x20-\x7E]+$', password):
+            return False, "La contraseña contiene caracteres no válidos (solo ASCII imprimible)"
+        if '"' in password:
+            return False, "La contraseña no puede contener comillas dobles (\") con netsh"
+        return True, "Contraseña válida"
     
     def validate_ssid(self, ssid: str) -> tuple[bool, str]:
         if len(ssid) < 1 or len(ssid) > 32:
@@ -74,38 +78,44 @@ class HotspotManager:
         return True, "SSID valido"
     
     def _check_hosted_network_support(self) -> tuple[bool, str]:
-        code, out, err, _ = run_command("netsh wlan show drivers", "VERIFICAR SOPORTE")
+        code, out, err, _ = run_command(
+            ["netsh", "wlan", "show", "drivers"], "VERIFICAR SOPORTE"
+        )
         if code != 0:
             return False, "No se pudo verificar compatibilidad"
-        
-        output_lower = out.lower()
-        if "hosted network supported" in output_lower:
-            after_supported = output_lower.split("hosted network supported")[1][:30]
-            if "yes" in after_supported:
+
+        lower = out.lower()
+        # Inglés e Español
+        if "hosted network supported" in lower:
+            snippet = lower.split("hosted network supported")[1][:60]
+            if ": yes" in snippet or ":yes" in snippet:
                 return True, "Compatible"
-        
+        elif "red hospedada admitida" in lower:
+            snippet = lower.split("red hospedada admitida")[1][:60]
+            if ": s" in snippet:
+                return True, "Compatible"
+
         adapter_name = ""
         for line in out.split("\n"):
             if "Interface name" in line or "Nombre de interfaz" in line:
                 adapter_name = line.split(":")[-1].strip() if ":" in line else ""
                 break
-        
+
         return False, f"""ADAPTADOR NO COMPATIBLE
 ========================
 Adaptador: {adapter_name if adapter_name else 'Desconocido'}
 
 Tu adaptador WiFi NO soporta Hosted Network.
-El comando netsh wlan start hostednetwork NO funcionara.
+El comando netsh wlan start hostednetwork NO funcionará.
 
-SOLUCION ALTERNATIVA:
-Usa el Mobile Hotspot de Windows:
-  1. Configuracion > Red e Internet > Hotspot movil
-  2. Activa "Compartir mi conexion a Internet"
+SOLUCIÓN ALTERNATIVA:
+Usa el método Mobile Hotspot (WinRT) de esta aplicación,
+o manualmente: Configuración > Red > Zona de conexión móvil
 """
     
     def _get_hotspot_adapter_name(self) -> Optional[str]:
         """Obtiene el nombre del adaptador virtual del hotspot."""
-        code, out, err, _ = run_command("netsh interface show interface", "LIST_ADAPTERS")
+        code, out, err, _ = run_command(["netsh", "interface", "show", "interface"], "LIST_ADAPTERS")
         if code != 0:
             return None
         
@@ -205,7 +215,7 @@ try {{
         
         try:
             result = subprocess.run(
-                ["powershell", "-Command", ps_script],
+                ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
                 capture_output=True,
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -262,15 +272,19 @@ try {{
         self._ssid = ssid
         self._password = password
         
-        set_cmd = f'netsh wlan set hostednetwork mode=allow ssid="{ssid}" key="{password}"'
-        code, out, err, debug_info = run_command(set_cmd, "CONFIGURAR HOTSPOT")
-        
+        code, out, err, debug_info = run_command(
+            ["netsh", "wlan", "set", "hostednetwork",
+             "mode=allow", f"ssid={ssid}", f"key={password}"],
+            "CONFIGURAR HOTSPOT",
+        )
+
         if code != 0:
             error_msg = err if err else out
             return False, f"Error al configurar el hotspot.\n\n{error_handler.format_error(error_msg, debug_info)}"
-        
-        start_cmd = "netsh wlan start hostednetwork"
-        code, out, err, debug_info = run_command(start_cmd, "INICIAR HOTSPOT")
+
+        code, out, err, debug_info = run_command(
+            ["netsh", "wlan", "start", "hostednetwork"], "INICIAR HOTSPOT"
+        )
         
         if code == 0:
             self._is_running = True
@@ -294,7 +308,7 @@ try {{
     def stop_hotspot(self) -> tuple[bool, str]:
         error_handler.DebugLogger.clear()
         
-        code, out, err, debug_info = run_command("netsh wlan stop hostednetwork", "DETENER HOTSPOT")
+        code, out, err, debug_info = run_command(["netsh", "wlan", "stop", "hostednetwork"], "DETENER HOTSPOT")
         
         if code == 0:
             self._is_running = False
@@ -312,7 +326,9 @@ try {{
             self.stop_hotspot()
             error_handler.DebugLogger.clear()
         
-        code, out, err, debug_info = run_command("netsh wlan set hostednetwork mode=disallow", "ELIMINAR HOTSPOT")
+        code, out, err, debug_info = run_command(
+            ["netsh", "wlan", "set", "hostednetwork", "mode=disallow"], "ELIMINAR HOTSPOT"
+        )
         
         if code == 0:
             self._ssid = None
@@ -327,7 +343,7 @@ try {{
     def get_status(self) -> tuple[bool, str]:
         error_handler.DebugLogger.clear()
         
-        code, out, err, debug_info = run_command("netsh wlan show hostednetwork", "OBTENER ESTADO")
+        code, out, err, debug_info = run_command(["netsh", "wlan", "show", "hostednetwork"], "OBTENER ESTADO")
         
         if code != 0:
             error_msg = err if err else out
@@ -340,56 +356,53 @@ try {{
     def check_support(self) -> tuple[bool, str]:
         error_handler.DebugLogger.clear()
         
-        code, out, err, debug_info = run_command("netsh wlan show drivers", "VERIFICAR COMPATIBILIDAD")
-        
+        code, out, err, debug_info = run_command(
+            ["netsh", "wlan", "show", "drivers"], "VERIFICAR COMPATIBILIDAD"
+        )
+
         if code != 0:
             return False, f"No se pudo verificar la compatibilidad.\n\n{error_handler.format_error(err if err else out, debug_info)}"
-        
-        output_lower = out.lower()
-        
+
+        lower = out.lower()
+
         adapter_name = ""
         for line in out.split("\n"):
             if "Interface name" in line or "Nombre de interfaz" in line:
                 adapter_name = line.split(":")[-1].strip() if ":" in line else ""
                 break
-        
-        if "hosted network supported" in output_lower:
-            after_supported = output_lower.split("hosted network supported")[1][:30]
-            if "yes" in after_supported:
-                admin_note = ""
-                if not is_admin():
-                    admin_note = "\n\nADVERTENCIA: No estas ejecutando como Administrador."
-                if error_handler.DebugLogger.is_enabled():
-                    return True, f"Adaptador COMPATIBLE.{admin_note}\n\n{error_handler.DebugLogger.get_full_report()}"
-                return True, f"Tu adaptador WiFi ({adapter_name}) es COMPATIBLE con Hosted Network.{admin_note}"
-            
-            error_msg = f"""ADAPTADOR NO COMPATIBLE DETECTADO
+
+        # Inglés e Español
+        is_supported = False
+        if "hosted network supported" in lower:
+            snippet = lower.split("hosted network supported")[1][:60]
+            is_supported = ": yes" in snippet or ":yes" in snippet
+        elif "red hospedada admitida" in lower:
+            snippet = lower.split("red hospedada admitida")[1][:60]
+            is_supported = ": s" in snippet
+
+        if is_supported:
+            admin_note = ""
+            if not is_admin():
+                admin_note = "\n\nADVERTENCIA: No estás ejecutando como Administrador."
+            if error_handler.DebugLogger.is_enabled():
+                return True, f"Adaptador COMPATIBLE.{admin_note}\n\n{error_handler.DebugLogger.get_full_report()}"
+            return True, f"Tu adaptador WiFi ({adapter_name}) es COMPATIBLE con Hosted Network.{admin_note}"
+
+        error_msg = f"""ADAPTADOR NO COMPATIBLE
 ================================
 Adaptador: {adapter_name if adapter_name else 'Desconocido'}
 Hosted Network: NO SOPORTADO
 
-Este adaptador NO puede crear un hotspot usando netsh.
+Este adaptador NO puede crear un hotspot con netsh.
 
 SOLUCIONES ALTERNATIVAS:
-
-1. Usar Mobile Hotspot de Windows:
-   - Ve a Configuracion > Red e Internet > Hotspot movil
-   - Activa "Comartir mi conexion a Internet"
-   - Este metodo puede funcionar aunque netsh no lo soporte
-
-2. Usar un adaptador USB WiFi compatible:
-   - TP-Link TL-WN722N (version 1)
-   - Alfa AWUS036NHA / AWUS036ACH
-   - Panda PAU09 / PAU05
-   - Netgear A6210
-
-3. Intentar actualizar drivers:
-   - Visita la web del fabricante (Realtek, Intel, etc.)
-   - Busca drivers especificos para tu modelo
+1. Usa el método Mobile Hotspot (WinRT) de esta aplicación
+2. Actualiza el driver WiFi desde el sitio del fabricante
+3. Configuración > Red > Zona de conexión móvil (nativo Windows)
 """
-            if error_handler.DebugLogger.is_enabled():
-                error_msg += f"\n{error_handler.DebugLogger.get_full_report()}"
-            return False, error_msg
+        if error_handler.DebugLogger.is_enabled():
+            error_msg += f"\n{error_handler.DebugLogger.get_full_report()}"
+        return False, error_msg
         
         return False, "No se pudo determinar la compatibilidad."
 
