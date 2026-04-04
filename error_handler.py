@@ -1,10 +1,19 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import ClassVar, Dict, List, Optional, Any
 import subprocess
 import ctypes
 import datetime
-import re
 import socket
+
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
 
 @dataclass
 class DebugInfo:
@@ -15,34 +24,32 @@ class DebugInfo:
     stderr: str
     timestamp: str
     success: bool
-    
+
     def to_string(self) -> str:
         status = "OK" if self.success else "FALLO"
         lines = [
             f"[{self.timestamp}] Paso: {self.step}",
             f"Estado: {status}",
-            f"Comando ejecutado:",
+            "Comando ejecutado:",
             f"  {self.command}",
-            f"Codigo de retorno: {self.return_code}",
+            f"Código de retorno: {self.return_code}",
         ]
-        
         if self.stdout.strip():
             lines.append("Salida (stdout):")
             for line in self.stdout.strip().split("\n"):
                 lines.append(f"  {line}")
-        
         if self.stderr.strip():
             lines.append("Error (stderr):")
             for line in self.stderr.strip().split("\n"):
                 lines.append(f"  {line}")
-        
         return "\n".join(lines)
 
 
 class DebugLogger:
-    _instance = None
-    _enabled = False
-    _logs: List[DebugInfo] = []
+    # CORRECCIÓN: no usar mutable como default de clase.
+    # Se inicializa en la definición pero se reemplaza en clear() con una nueva lista.
+    _enabled: ClassVar[bool] = False
+    _logs: ClassVar[List[DebugInfo]] = []
     
     @classmethod
     def enable(cls):
@@ -92,7 +99,8 @@ class DebugLogger:
         return "\n".join(lines)
     
     @classmethod
-    def clear(cls):
+    def clear(cls) -> None:
+        # Crear nueva lista para evitar que referencias externas vean cambios
         cls._logs = []
 
 
@@ -291,22 +299,55 @@ def format_developer_error(raw_error: str, debug_info: DebugInfo) -> str:
     return "\n".join(lines)
 
 
-def check_admin_error() -> str:
+def get_windows_build() -> int:
+    """
+    Devuelve el número de build de Windows (ej: 26200 para 25H2).
+    Útil para detectar el bug de ICS DHCP presente en Build 26200+.
+    """
     try:
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            return "ADVERTENCIA: No estas ejecutando como Administrador.\nAlgunas funciones pueden fallar.\n\nClic derecho > Ejecutar como administrador"
-    except:
-        pass
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        )
+        build_str, _ = winreg.QueryValueEx(key, "CurrentBuildNumber")
+        winreg.CloseKey(key)
+        return int(build_str)
+    except Exception:
+        return 0
+
+
+def is_affected_by_ics_bug() -> bool:
+    """
+    Detecta si el sistema está afectado por el bug de ICS/DHCP de
+    Windows 11 25H2 (Build 26200+).
+
+    En este build el servidor DHCP de ICS falla: el hotspot se activa
+    pero los dispositivos no reciben IP y no tienen internet.
+    Referencia: HP Community forums, Build 26200 (25H2) con MediaTek/Realtek.
+    """
+    return get_windows_build() >= 26200
+
+
+def check_admin_error() -> str:
+    if not _is_admin():
+        return (
+            "ADVERTENCIA: No estás ejecutando como Administrador.\n"
+            "Algunas funciones pueden fallar.\n\n"
+            "Clic derecho > Ejecutar como administrador"
+        )
     return ""
 
 
 def has_internet_connection() -> bool:
-    """Verifica si hay conexion activa a internet."""
-    try:
-        socket.create_connection(("8.8.8.8", 53), timeout=3)
-        return True
-    except:
-        return False
+    """Verifica si hay conexión activa a internet."""
+    for host in (("8.8.8.8", 53), ("1.1.1.1", 53)):
+        try:
+            socket.create_connection(host, timeout=3)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def diagnose_network() -> str:
@@ -318,62 +359,41 @@ def diagnose_network() -> str:
         issues.append("- NO hay conexion a internet en la computadora")
         recommendations.append("CONSEJO CRITICO: Conecta la computadora a internet antes de crear el hotspot")
     
-    try:
-        result = subprocess.run(
-            "netsh wlan show drivers",
-            shell=True,
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            encoding='utf-8',
-            errors='ignore'
-        )
-        output = result.stdout.lower()
-        
-        if "hosted network supported" in output:
-            if "yes" not in output.split("hosted network supported")[1][:30]:
-                issues.append("- Tu adaptador NO soporta Hosted Network")
-                recommendations.append("USA Mobile Hotspot de Windows en lugar de netsh")
-        
-        if "not found" in output or "no wireless" in output:
-            issues.append("- No se detecto adaptador WiFi")
-    
-    except Exception as e:
-        issues.append(f"- Error al verificar drivers WiFi: {str(e)}")
-    
-    try:
-        result = subprocess.run(
-            "netsh wlan show interfaces",
-            shell=True,
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            encoding='utf-8',
-            errors='ignore'
-        )
-        output = result.stdout.lower()
-        
-        if "disconnected" in output or "sin conexion" in output:
-            issues.append("- El WiFi esta desconectado")
-        
-        if "hardware off" in output or "apagado" in output:
-            issues.append("- El WiFi esta apagado")
-    except Exception as e:
-        issues.append(f"- Error al verificar interfaces: {str(e)}")
-    
+    def _run_diag(cmd: list) -> str:
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                encoding="utf-8", errors="ignore",
+            )
+            return r.stdout.lower()
+        except Exception:
+            return ""
+
+    # Verificar soporte de Hosted Network (inglés y español)
+    out = _run_diag(["netsh", "wlan", "show", "drivers"])
+    if "hosted network supported" in out:
+        if "yes" not in out.split("hosted network supported")[1][:30]:
+            issues.append("- Tu adaptador NO soporta Hosted Network (netsh)")
+            recommendations.append("Usa el método Mobile Hotspot de Windows en lugar de netsh")
+    elif "red hospedada admitida" in out:
+        if ": s" not in out.split("red hospedada admitida")[1][:30]:
+            issues.append("- Tu adaptador NO soporta Hosted Network (netsh)")
+            recommendations.append("Usa el método Mobile Hotspot de Windows en lugar de netsh")
+    if "not found" in out or "no wireless" in out:
+        issues.append("- No se detectó adaptador WiFi")
+
+    # Verificar estado del adaptador WiFi
+    out2 = _run_diag(["netsh", "wlan", "show", "interfaces"])
+    if "disconnected" in out2 or "sin conexion" in out2 or "desconectado" in out2:
+        issues.append("- El WiFi está desconectado")
+    if "hardware off" in out2 or "apagado" in out2:
+        issues.append("- El WiFi está apagado por hardware")
+
     # Verificar servicio ICS
-    try:
-        result = subprocess.run(
-            "sc query SharedAccess",
-            shell=True,
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        if "STOPPED" in result.stdout:
-            recommendations.append("- El servicio ICS (SharedAccess) esta detenido. El hotspot podria no compartir internet.")
-    except:
-        pass
+    out3 = _run_diag(["sc", "query", "SharedAccess"])
+    if "stopped" in out3:
+        recommendations.append("El servicio ICS (SharedAccess) está detenido — el hotspot puede no compartir internet")
     
     # Construir mensaje
     output_lines = []
@@ -448,9 +468,9 @@ def enable_ics(internet_adapter: str, hotspot_adapter: str) -> tuple[bool, str]:
     Returns:
         Tuple[bool, str]: (exito, mensaje)
     """
-    error_handler.DebugLogger.clear()
+    DebugLogger.clear()
     
-    if not is_admin():
+    if not _is_admin():
         return False, "Se requieren permisos de administrador para habilitar ICS"
     
     # Script PowerShell para habilitar ICS
@@ -494,7 +514,7 @@ try {{
     
     try:
         result = subprocess.run(
-            ["powershell", "-Command", ps_script],
+            ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
             capture_output=True,
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -535,9 +555,9 @@ def configure_hotspot_dns(adapter_name: str, dns_servers: list = None) -> tuple[
     if dns_servers is None:
         dns_servers = ["8.8.8.8", "8.8.4.4"]  # Google DNS
     
-    error_handler.DebugLogger.clear()
+    DebugLogger.clear()
     
-    if not is_admin():
+    if not _is_admin():
         return False, "Se requieren permisos de administrador"
     
     ps_script = f'''
@@ -558,7 +578,7 @@ try {{
     
     try:
         result = subprocess.run(
-            ["powershell", "-Command", ps_script],
+            ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
             capture_output=True,
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -587,54 +607,46 @@ try {{
 
 def reset_network_stack() -> tuple[bool, str]:
     """Reinicia la pila de red de Windows."""
-    error_handler.DebugLogger.clear()
+    DebugLogger.clear()
     
-    if not is_admin():
+    if not _is_admin():
         return False, "Se requieren permisos de administrador"
     
-    commands = [
-        "netsh winsock reset",
-        "netsh int ip reset",
-        "ipconfig /release",
-        "ipconfig /renew",
-        "ipconfig /flushdns"
+    commands: List[List[str]] = [
+        ["netsh", "winsock", "reset"],
+        ["netsh", "int", "ip", "reset"],
+        ["ipconfig", "/release"],
+        ["ipconfig", "/renew"],
+        ["ipconfig", "/flushdns"],
     ]
-    
+
     results = []
     for cmd in commands:
         try:
             result = subprocess.run(
                 cmd,
-                shell=True,
                 capture_output=True,
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
-                timeout=30
+                timeout=30,
             )
-            
-            debug_info = DebugLogger.log(
-                step=f"RESET_{cmd.split()[0]}",
-                command=cmd,
+            DebugLogger.log(
+                step=f"RESET_{cmd[0]}",
+                command=" ".join(cmd),
                 return_code=result.returncode,
                 stdout=result.stdout,
-                stderr=result.stderr
+                stderr=result.stderr,
             )
-            
             results.append({
-                'command': cmd,
-                'success': result.returncode == 0,
-                'output': result.stdout if result.stdout else result.stderr
+                "command": " ".join(cmd),
+                "success": result.returncode == 0,
+                "output": result.stdout or result.stderr,
             })
-        except Exception as e:
-            results.append({
-                'command': cmd,
-                'success': False,
-                'output': str(e)
-            })
+        except Exception as exc:
+            results.append({"command": " ".join(cmd), "success": False, "output": str(exc)})
     
-    failed = [r for r in results if not r['success']]
-    
+    failed = [r for r in results if not r["success"]]
     if failed:
-        return False, f"Algunos comandos fallaron:\n" + "\n".join([f"- {r['command']}: {r['output']}" for r in failed])
-    
-    return True, "Pila de red reiniciada exitosamente. Se requiere reiniciar la computadora."
+        detail = "\n".join(f"- {r['command']}: {r['output']}" for r in failed)
+        return False, f"Algunos comandos fallaron:\n{detail}"
+    return True, "Pila de red reiniciada. Se recomienda reiniciar el equipo."

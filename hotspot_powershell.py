@@ -11,10 +11,10 @@ def is_admin() -> bool:
 def run_powershell(command: str, step: str = "") -> tuple[bool, str, error_handler.DebugInfo]:
     try:
         result = subprocess.run(
-            ["powershell", "-Command", command],
+            ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         
         debug_info = error_handler.DebugLogger.log(
@@ -47,29 +47,37 @@ def _check_hosted_network_support() -> tuple[bool, str]:
     if not success:
         return False, "No se pudo verificar compatibilidad"
     
-    output_lower = msg.lower()
-    if "hosted network supported" in output_lower:
-        after_supported = output_lower.split("hosted network supported")[1][:30]
-        if "yes" in after_supported:
+    lower = msg.lower()
+
+    # Inglés: "Hosted network supported  : Yes"
+    if "hosted network supported" in lower:
+        snippet = lower.split("hosted network supported")[1][:60]
+        if ": yes" in snippet or ":yes" in snippet:
             return True, "Compatible"
-    
+
+    # Español: "Red hospedada admitida    : Sí"
+    elif "red hospedada admitida" in lower:
+        snippet = lower.split("red hospedada admitida")[1][:60]
+        if ": s" in snippet:
+            return True, "Compatible"
+
     adapter_name = ""
     for line in msg.split("\n"):
-        if "Interface name" in line:
+        if "Interface name" in line or "Nombre de interfaz" in line:
             adapter_name = line.split(":")[-1].strip() if ":" in line else ""
             break
-    
+
     return False, f"""ADAPTADOR NO COMPATIBLE
 ========================
 Adaptador: {adapter_name if adapter_name else 'Desconocido'}
 
 Tu adaptador WiFi NO soporta Hosted Network.
-El comando netsh wlan start hostednetwork NO funcionara.
+El comando netsh wlan start hostednetwork NO funcionará.
 
-SOLUCION ALTERNATIVA:
-Usa el Mobile Hotspot de Windows:
-  1. Configuracion > Red e Internet > Hotspot movil
-  2. Activa "Compartir mi conexion a Internet"
+SOLUCIÓN ALTERNATIVA:
+Usa el Mobile Hotspot de Windows (método WinRT):
+  — Esta aplicación: selecciona 'Mobile Hotspot'
+  — O manualmente: Configuración > Red e Internet > Zona de conexión móvil
 """
 
 def create_hotspot(ssid: str, password: str) -> tuple[bool, str]:
@@ -150,38 +158,46 @@ def check_support() -> tuple[bool, str]:
     success, msg, debug_info = run_powershell("netsh wlan show drivers", "VERIFICAR COMPATIBILIDAD")
     
     if success:
-        if "hosted network supported" in msg.lower():
-            after_supported = msg.lower().split("hosted network supported")[1][:30]
-            if "yes" in after_supported:
-                admin_note = ""
-                if not is_admin():
-                    admin_note = "\n\nADVERTENCIA: No estas ejecutando como Administrador."
-                if error_handler.DebugLogger.is_enabled():
-                    return True, f"Adaptador COMPATIBLE.{admin_note}\n\n{error_handler.DebugLogger.get_full_report()}"
-                return True, f"Tu adaptador WiFi es COMPATIBLE con Hosted Network.{admin_note}"
-            
-            adapter_name = ""
-            for line in msg.split("\n"):
-                if "Interface name" in line:
-                    adapter_name = line.split(":")[-1].strip() if ":" in line else ""
-                    break
-            
-            error_msg = f"""ADAPTADOR NO COMPATIBLE DETECTADO
+        lower = msg.lower()
+        is_supported = False
+
+        # Inglés e Español
+        if "hosted network supported" in lower:
+            snippet = lower.split("hosted network supported")[1][:60]
+            is_supported = ": yes" in snippet or ":yes" in snippet
+        elif "red hospedada admitida" in lower:
+            snippet = lower.split("red hospedada admitida")[1][:60]
+            is_supported = ": s" in snippet
+
+        if is_supported:
+            admin_note = ""
+            if not is_admin():
+                admin_note = "\n\nADVERTENCIA: No estás ejecutando como Administrador."
+            if error_handler.DebugLogger.is_enabled():
+                return True, f"Adaptador COMPATIBLE.{admin_note}\n\n{error_handler.DebugLogger.get_full_report()}"
+            return True, f"Tu adaptador WiFi es COMPATIBLE con Hosted Network.{admin_note}"
+
+        adapter_name = ""
+        for line in msg.split("\n"):
+            if "Interface name" in line or "Nombre de interfaz" in line:
+                adapter_name = line.split(":")[-1].strip() if ":" in line else ""
+                break
+
+        error_msg = f"""ADAPTADOR NO COMPATIBLE DETECTADO
 ================================
 Adaptador: {adapter_name if adapter_name else 'Desconocido'}
 Hosted Network: NO SOPORTADO
 
-Este adaptador NO puede crear un hotspot usando netsh.
+Este adaptador NO puede crear un hotspot con netsh.
 
-SOLUCION ALTERNATIVA:
-Usa Mobile Hotspot de Windows:
-  1. Configuracion > Red e Internet > Hotspot movil
-  2. Activa "Compartir mi conexion a Internet"
+SOLUCIÓN ALTERNATIVA:
+Usa el método Mobile Hotspot (WinRT) de esta aplicación,
+o manualmente: Configuración > Red > Zona de conexión móvil
 """
-            if error_handler.DebugLogger.is_enabled():
-                error_msg += f"\n{error_handler.DebugLogger.get_full_report()}"
-            return False, error_msg
-    
+        if error_handler.DebugLogger.is_enabled():
+            error_msg += f"\n{error_handler.DebugLogger.get_full_report()}"
+        return False, error_msg
+
     return False, f"No se pudo verificar compatibilidad.\n\n{error_handler.format_error(msg, debug_info)}"
 
 def diagnose() -> str:
