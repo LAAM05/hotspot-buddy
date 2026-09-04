@@ -1,121 +1,123 @@
-# MyHotspot - Gestor de Punto de Acceso Wi-Fi
+# MyHotspot — Gestor de Punto de Acceso Wi-Fi
 
-Aplicacion con interfaz grafica para Windows 11 que permite crear, gestionar y eliminar un punto de acceso Wi-Fi (hotspot).
+Aplicacion con interfaz grafica dark mode para Windows 11 que permite crear, gestionar y reparar un punto de acceso Wi-Fi (hotspot). Incluye fix especifico para el bug de ICS/DHCP de Windows 11 25H2 (Build 26200+).
 
 ## Requisitos
 
 - Windows 10 (1903+) o Windows 11
 - Python >= 3.12
-- Privilegios de administrador (recomendado)
+- Privilegios de administrador (la app solicita elevacion UAC automaticamente)
 
 ## Instalacion
 
 ```bash
 pip install -r requirements.txt
-```
-
-## Uso
-
-```bash
 python main.py
 ```
-
-**Nota:** Ejecutar como administrador para permitir la gestion del hotspot.
 
 ## Estructura del Proyecto
 
 ```
 MyHotspot/
-├── main.py                 # Interfaz grafica (Tkinter)
-├── hotspot_mobile.py       # Mobile Hotspot (Windows API) - RECOMENDADO
-├── hotspot_python.py       # Implementacion nativa Python (netsh)
-├── hotspot_powershell.py   # Implementacion con PowerShell (netsh)
-├── error_handler.py        # Manejo de errores y modo desarrollador
+├── main.py                 # Interfaz grafica dark mode (Tkinter)
+├── hotspot_mobile.py       # Mobile Hotspot via WinRT API — RECOMENDADO
+├── hotspot_python.py       # netsh wlan via subprocess nativo
+├── hotspot_powershell.py   # netsh wlan via PowerShell
+├── error_handler.py        # Logging, diagnostico y deteccion de builds
+├── fix_hotspot.py          # Script CLI standalone (pruebas / uso sin GUI)
 ├── requirements.txt        # Dependencias
 ├── MyHotspot.spec          # Configuracion PyInstaller
-└── README.md               # Documentacion
+└── README.md
 ```
 
 ## Metodos de Implementacion
 
-### 1. Mobile Hotspot (Recomendado)
+### 1. Mobile Hotspot — WinRT API (Recomendado)
 
 | Aspecto | Descripcion |
 |---------|-------------|
-| **Implementacion** | Usa `Windows.Networking.NetworkOperators` API de Windows 10/11 |
+| **API** | `Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager` |
 | **Compatibilidad** | Funciona con adaptadores que NO soportan `netsh wlan start hostednetwork` |
-| **Ventajas** | Mas compatible, usa las mismas APIs que el Mobile Hotspot de Windows |
-| **Desventajas** | Requiere Windows 10+ |
-| **Caso de uso** | **RECOMENDADO** - Funciona con adaptadores Realtek modernos |
+| **Caso de uso** | **RECOMENDADO** — unico metodo funcional en Realtek 8852BE-VT y similares |
+| **Requiere** | Windows 10 1903+ |
 
-### 2. Python (Nativo)
-
-| Aspecto | Descripcion |
-|---------|-------------|
-| **Implementacion** | Ejecuta `netsh wlan` directamente con `subprocess` |
-| **Compatibilidad** | Solo funciona si `Hosted network supported: Yes` |
-| **Ventajas** | Mas rapido, control granular |
-| **Desventajas** | No funciona con muchos adaptadores Realtek modernos |
-| **Caso de uso** | Adaptadores Intel, antiguos que soporten Hosted Network |
-
-### 3. PowerShell
+### 2. Python / PowerShell — netsh (Fallback)
 
 | Aspecto | Descripcion |
 |---------|-------------|
-| **Implementacion** | Ejecuta `netsh wlan` mediante `powershell.exe` |
+| **API** | `netsh wlan set/start hostednetwork` |
 | **Compatibilidad** | Solo funciona si `Hosted network supported: Yes` |
-| **Ventajas** | Simple, sin dependencias |
-| **Desventajas** | Overhead de PowerShell, misma limitacion de compatibilidad |
-| **Caso de uso** | Debugging, comparacion de metodos |
+| **Caso de uso** | Adaptadores Intel o drivers antiguos con soporte Hosted Network |
 
-## Por que mi adaptador no funciona con netsh?
+> La mayoria de adaptadores Realtek modernos reportan `Hosted network supported: No`.
+> En ese caso el unico metodo funcional es Mobile Hotspot.
 
+## Modo local sin internet (estilo Connectify)
+
+El hotspot se puede crear **aunque la PC no tenga conexion a internet**:
+
+- Los dispositivos se conectan a la red y se ven entre si (compartir archivos, juegos LAN, etc.), pero sin acceso a internet.
+- Con el metodo Mobile Hotspot, si no hay perfil de internet se usa cualquier perfil de red disponible; sin ningun perfil de red la app cae automaticamente al metodo netsh.
+- Con el metodo netsh, la configuracion de ICS se omite cuando no hay WAN (no tiene sentido compartir lo que no existe) y se muestra una advertencia.
+- Al recuperar internet: pulsa **"Reparar conectividad"** (metodo Mobile) o recrea el hotspot (metodo netsh).
+
+## Bug de ICS/DHCP en Windows 11 25H2 (Build 26200+)
+
+**Sintoma:** el hotspot se activa y los dispositivos ven la red, pero no reciben IP → sin internet.
+
+**Causa:** bug en la pila ICS de Windows 11 25H2. No es un problema de driver ni de la app.
+Confirmado en HP Victus con MediaTek MT7921 y Realtek 8852BE-VT con el mismo OS Build.
+`sfc /scannow` y `DISM` no detectan corrupcion porque no la hay.
+
+**Solucion integrada:**
+Tras iniciar el hotspot la app aplica automaticamente el fix. Tambien esta disponible como boton **"Reparar conectividad"** para ejecutarlo manualmente cuando el hotspot ya esta activo:
+
+1. Forzar IP estatica `192.168.137.1/24` en el adaptador virtual Wi-Fi Direct
+2. Activar `IPEnableRouter=1` en registro (necesario para que ICS enrute paquetes)
+3. Fijar `ScopeAddress` en los parametros del servicio SharedAccess
+4. Reiniciar servicios en orden: `icssvc` → `SharedAccess` → `Dhcp`
+
+## Funciones Exportadas
+
+Todos los modulos implementan la misma interfaz:
+
+```python
+def create_hotspot(ssid: str, password: str) -> tuple[bool, str]
+def stop_hotspot()    -> tuple[bool, str]
+def delete_hotspot()  -> tuple[bool, str]
+def get_status()      -> tuple[bool, str]
+def check_support()   -> tuple[bool, str]
+def diagnose()        -> str
+def fix_connectivity() -> tuple[bool, str]   # hotspot_mobile unicamente
 ```
-Hosted network supported: No
-```
 
-Muchos adaptadores **Realtek** modernos (como el 8852BE-VT) NO soportan el comando `netsh wlan start hostednetwork`. Esto es una limitacion del driver, no de Windows.
+## Solucion de Problemas
 
-**Solucion:** Usa el metodo **Mobile Hotspot** que usa APIs modernas de Windows que pueden funcionar aunque netsh no lo haga.
+| Error | Causa | Solucion |
+|-------|-------|----------|
+| `Hosted network supported: No` | Driver no soporta netsh | Usar metodo **Mobile Hotspot** |
+| `Access is denied` | Sin privilegios | La app pide UAC automaticamente; si falla, ejecutar como admin |
+| Dispositivos conectados sin internet | La PC no tiene WAN (modo local) | El hotspot funciona en red local; al recuperar internet usa **"Reparar conectividad"** o recrea el hotspot |
+| `No se encontró ningún perfil de red` | Ninguna interfaz conectada a red alguna (solo método Mobile) | La app cae automaticamente al metodo netsh, que no lo requiere |
+| Dispositivos se conectan pero sin internet | Bug ICS Build 26200 | Pulsar **"Reparar conectividad"** |
+| `Element not found / MobileBroadbandAccount` | Error antiguo ya corregido | Actualizar a la version actual |
 
-## Como crear el ejecutable
+## Modo Desarrollador
+
+Activa el checkbox **"Modo Desarrollador"** en la GUI para ver:
+
+- Comando exacto ejecutado (PowerShell o netsh)
+- Codigo de retorno
+- Salida stdout / stderr completa
+- Timestamp de cada operacion
+
+Util para diagnosticar fallos o reportar bugs.
+
+## Generar Ejecutable
 
 ```bash
 pip install pyinstaller
 pyinstaller MyHotspot.spec
 ```
 
-El ejecutable estara en `dist/MyHotspot.exe`
-
-## Funciones Comunes
-
-Todos los modulos implementan la misma interfaz:
-
-```python
-def create_hotspot(ssid: str, password: str) -> tuple[bool, str]
-def stop_hotspot() -> tuple[bool, str]
-def delete_hotspot() -> tuple[bool, str]
-def get_status() -> tuple[bool, str]
-def check_support() -> tuple[bool, str]
-def diagnose() -> str
-```
-
-## Solucion de Problemas
-
-| Error | Solucion |
-|-------|----------|
-| "Hosted network supported: No" | Usar metodo Mobile Hotspot |
-| "Access is denied" | Ejecutar como administrador |
-| "No hay conexion a internet" | Conectarse a internet primero |
-| "The group or resource is not in the correct state" | Reiniciar adaptador WiFi o PC |
-
-## Modo Desarrollador
-
-Activa el checkbox "Modo Desarrollador" para ver:
-- Comando exacto ejecutado
-- Codigo de retorno
-- Salida stdout/stderr
-- Timestamp de cada operacion
-- Reporte completo de la sesion
-
-Esto ayuda a diagnosticar problemas tecnicos.
+El ejecutable estara en `dist/MyHotspot.exe`. No requiere Python instalado.

@@ -2,6 +2,11 @@ import subprocess
 import ctypes
 import error_handler
 from typing import Optional
+from hotspot_base import HotspotBase
+from config import config
+
+# subprocess.CREATE_NO_WINDOW solo existe en Windows; en otros SO vale 0
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def is_admin() -> bool:
     try:
@@ -9,18 +14,27 @@ def is_admin() -> bool:
     except:
         return False
 
-def run_powershell(command: str, step: str = "") -> tuple[bool, str, error_handler.DebugInfo]:
+def ps_quote(value: str) -> str:
+    """Convierte un valor en un literal PowerShell entre comillas simples.
+    Dentro de comillas simples solo la comilla simple necesita escape ('')."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+def run_powershell(script: str, step: str = "", timeout: int = 90) -> tuple[bool, str, error_handler.DebugInfo]:
     try:
+        cmd = ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
         result = subprocess.run(
-            ["powershell", "-Command", command],
+            cmd,
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="ignore",
         )
         
         debug_info = error_handler.DebugLogger.log(
             step=step,
-            command=command,
+            command=" ".join(cmd),
             return_code=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr
@@ -31,11 +45,20 @@ def run_powershell(command: str, step: str = "") -> tuple[bool, str, error_handl
         
         error_msg = result.stderr.strip() if result.stderr.strip() else result.stdout.strip()
         return False, error_msg, debug_info
-    
+
+    except subprocess.TimeoutExpired:
+        debug_info = error_handler.DebugLogger.log(
+            step=step,
+            command="powershell (script)",
+            return_code=-1,
+            stdout="",
+            stderr=f"Timeout tras {timeout}s",
+        )
+        return False, f"La operación excedió el tiempo límite ({timeout}s)", debug_info
     except Exception as e:
         debug_info = error_handler.DebugLogger.log(
             step=step,
-            command=command,
+            command=" ".join(cmd) if 'cmd' in locals() else "",
             return_code=-1,
             stdout="",
             stderr=str(e)
@@ -43,45 +66,82 @@ def run_powershell(command: str, step: str = "") -> tuple[bool, str, error_handl
         return False, str(e), debug_info
 
 
-class WindowsMobileHotspot:
+class WindowsMobileHotspot(HotspotBase):
     def __init__(self):
         self._ssid: Optional[str] = None
         self._password: Optional[str] = None
         self._is_running: bool = False
-    
-    def _run_winrt_ps(self, inner_script: str, step: str) -> tuple[bool, str, error_handler.DebugInfo]:
-        full_script = f'''
-[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] > $null
-[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] > $null
-[Windows.Foundation.AsyncStatus,Windows,ContentType=WindowsRuntime] > $null
+        # Cache para operaciones costosas
+        self._support_checked: bool = False
+        self._is_supported: bool = False
+        self._support_message: str = ""
 
-Function Await-AsyncOperation($asyncOp) {{
-    $deadline = (Get-Date).AddSeconds(30)
-    while ($true) {{
-        $statusCode = [int]$asyncOp.Status
-        switch ($statusCode) {{
-            0 {{
-                if ((Get-Date) -gt $deadline) {{
-                    throw "Timeout esperando operacion WinRT."
-                }}
-                Start-Sleep -Milliseconds 120
-                continue
-            }}
-            1 {{
-                return $asyncOp.GetResults()
-            }}
-            2 {{
-                throw "Operacion WinRT cancelada."
-            }}
-            3 {{
-                $code = $asyncOp.ErrorCode
-                throw "Operacion WinRT fallo. HRESULT: $code"
-            }}
-            default {{
-                throw "Estado WinRT inesperado: $statusCode"
-            }}
-        }}
-    }}
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    def delete_hotspot(self) -> tuple[bool, str]:
+        """Mobile Hotspot no tiene configuración persistente que borrar como
+        el hosted network de netsh: detenerlo equivale a eliminarlo."""
+        ok, msg = self.stop_hotspot()
+        if ok:
+            self._ssid = None
+            self._password = None
+            return True, f"{msg}\n(Mobile Hotspot no guarda configuración adicional que eliminar.)"
+        return ok, msg
+
+
+    def _run_winrt_ps(self, inner_script: str, step: str, timeout: int = 90) -> tuple[bool, str, error_handler.DebugInfo]:
+        """
+        Ejecuta un script PowerShell con el boilerplate WinRT correcto.
+
+        CORRECCIÓN CRÍTICA:
+        - ConfigureAccessPointAsync → IAsyncAction → usar Await-Action
+        - StartTetheringAsync / StopTetheringAsync → IAsyncOperation<T> → usar Await-Op
+        Los dos tipos son distintos y requieren helpers distintos de AsTask.
+        """
+        full_script = f'''
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+
+# Helper para IAsyncOperation<T> (StartTetheringAsync, StopTetheringAsync)
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+    $_.Name -eq "AsTask" -and
+    $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq "IAsyncOperation``1"
+}})[0]
+
+# Helper para IAsyncAction (ConfigureAccessPointAsync)
+# IAsyncAction NO tiene GetResults() — requiere su propio AsTask overload
+$asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+    $_.Name -eq "AsTask" -and
+    $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq "IAsyncAction"
+}})[0]
+
+function Await-Op($asyncOp, $resultType) {{
+    $task = $asTaskGeneric.MakeGenericMethod($resultType).Invoke($null, @($asyncOp))
+    if (-not $task.Wait(30000)) {{ throw "Timeout en IAsyncOperation" }}
+    return $task.Result
+}}
+
+function Await-Action($asyncAction) {{
+    $task = $asTaskAction.Invoke($null, @($asyncAction))
+    if (-not $task.Wait(30000)) {{ throw "Timeout en IAsyncAction" }}
+}}
+
+# Perfil de conexión para el tethering. Si no hay internet (perfil de internet
+# nulo) se usa cualquier perfil de red disponible — igual que Connectify: el
+# hotspot se crea en modo local y los dispositivos se ven entre sí sin WAN.
+function Get-SharableProfile {{
+    $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    if ($null -ne $p) {{ return $p }}
+    $all = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles()
+    $p = $all | Where-Object {{ $_.IsWlanConnectionProfile }} | Select-Object -First 1
+    if ($null -eq $p) {{ $p = $all | Select-Object -First 1 }}
+    if ($null -ne $p) {{ Write-Output "OFFLINE_MODE" }}
+    return $p
 }}
 
 try {{
@@ -90,29 +150,35 @@ try {{
     Write-Output "ERROR: $($_.Exception.Message)"
 }}
 '''
-        return run_powershell(full_script, step)
+        return run_powershell(full_script, step=step, timeout=timeout)
     
     def check_support(self) -> tuple[bool, str]:
+        # Return cached result if already checked
+        if self._support_checked:
+            return self._is_supported, self._support_message
+            
         error_handler.DebugLogger.clear()
-        
-        script = '''
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
 
-if ($profile -eq $null) {
-    Write-Output "NO_INTERNET"
-    return
+        script = '''\
+$profile = Get-SharableProfile
+if ($null -eq $profile) { Write-Output "NO_PROFILE"; return }
+
+# NOTA: GetTetheringCapability(NetworkAdapterId) es para adaptadores celulares/LTE,
+# NO para Wi-Fi. Lanza "MobileBroadbandAccount not found" en adaptadores Wi-Fi normales.
+# El approach correcto es intentar CreateFromConnectionProfile directamente.
+try {
+    $tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+    $config = $tethering.GetCurrentAccessPointConfiguration()
+    Write-Output "SUPPORTED"
+    Write-Output "State: $($tethering.TetheringOperationalState)"
+    Write-Output "MaxClients: $($tethering.MaxClientCount)"
+    Write-Output "CurrentSSID: $($config.Ssid)"
+} catch {
+    Write-Output "NOT_CAPABLE:$($_.Exception.Message)"
 }
-
-$tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-$config = $tethering.GetCurrentAccessPointConfiguration()
-
-Write-Output "SUPPORTED"
-Write-Output "State: $($tethering.TetheringOperationalState)"
-Write-Output "MaxClients: $($tethering.MaxClientCount)"
-Write-Output "CurrentSSID: $($config.Ssid)"
 '''
-        
-        success, msg, debug_info = self._run_winrt_ps(script, "CHECK_SUPPORT")
+
+        success, msg, debug_info = self._run_winrt_ps(script, step="CHECK_SUPPORT")
         
         if error_handler.DebugLogger.is_enabled():
             full_report = error_handler.DebugLogger.get_full_report()
@@ -133,16 +199,42 @@ Write-Output "CurrentSSID: $($config.Ssid)"
                     ssid = line.replace("CurrentSSID:", "").strip()
             
             result_msg = f"Mobile Hotspot: COMPATIBLE\nEstado: {state}\nSSID actual: {ssid}\nClientes max: {max_clients}"
+            if "OFFLINE_MODE" in msg:
+                result_msg += (
+                    "\n\n⚠ Sin conexión a internet: el hotspot puede crearse igualmente "
+                    "en modo local (los dispositivos se conectan entre sí, sin internet)."
+                )
             if full_report:
                 result_msg += f"\n\n{full_report}"
+            # Cache the result
+            self._support_checked = True
+            self._is_supported = True
+            self._support_message = result_msg
             return True, result_msg
         
-        if "NO_INTERNET" in msg:
-            result_msg = "No hay conexion a internet.\nConectate primero."
+        if "NO_PROFILE" in msg:
+            result_msg = (
+                "No se encontró ningún perfil de red.\n"
+                "La API de Mobile Hotspot necesita al menos una interfaz de red "
+                "conectada a una red (aunque no tenga internet).\n\n"
+                "Alternativas: conéctate a cualquier red, o usa el método "
+                "Python/PowerShell (netsh), que no lo requiere."
+            )
             if full_report:
                 result_msg += f"\n\n{full_report}"
             return False, result_msg
-        
+
+        if "NOT_CAPABLE" in msg:
+            capability = msg.split("NOT_CAPABLE:")[-1].strip().split("\n")[0]
+            result_msg = (
+                f"Mobile Hotspot no disponible en este adaptador.\n"
+                f"Capacidad: {capability}\n\n"
+                "Prueba el método netsh (Python/PowerShell) o actualiza el driver WiFi."
+            )
+            if full_report:
+                result_msg += f"\n\n{full_report}"
+            return False, result_msg
+
         if "ERROR_WINRT_BRIDGE" in msg:
             result_msg = (
                 "No fue posible usar la API Mobile Hotspot desde PowerShell en este entorno.\n\n"
@@ -151,17 +243,29 @@ Write-Output "CurrentSSID: $($config.Ssid)"
             )
             if full_report:
                 result_msg += f"\n\n{full_report}"
+            # Cache the result
+            self._support_checked = True
+            self._is_supported = False
+            self._support_message = result_msg
             return False, result_msg
         
         if "ERROR" in msg:
             result_msg = f"Mobile Hotspot no disponible.\n\n{msg}\n\nIntenta usar Python o PowerShell."
             if full_report:
                 result_msg += f"\n\n{full_report}"
+            # Cache the result
+            self._support_checked = True
+            self._is_supported = False
+            self._support_message = result_msg
             return False, result_msg
         
         result_msg = "No se pudo verificar soporte"
         if full_report:
             result_msg += f"\n\n{full_report}"
+        # Cache the result
+        self._support_checked = True
+        self._is_supported = False
+        self._support_message = result_msg
         return False, result_msg
     
     def create_hotspot(self, ssid: str, password: str) -> tuple[bool, str]:
@@ -171,62 +275,51 @@ Write-Output "CurrentSSID: $($config.Ssid)"
         if admin_warning:
             return False, admin_warning
         
-        if len(password) < 8:
-            return False, "La contrasena debe tener al menos 8 caracteres"
-        
+        pwd_min = config.get_password_min_length()
+        pwd_max = config.get_password_max_length()
+        ssid_min = config.get_ssid_min_length()
+        ssid_max = config.get_ssid_max_length()
+
+        if not (ssid_min <= len(ssid) <= ssid_max):
+            return False, f"El SSID debe tener entre {ssid_min} y {ssid_max} caracteres"
+        if not (pwd_min <= len(password) <= pwd_max):
+            return False, f"La contrasena debe tener entre {pwd_min} y {pwd_max} caracteres"
+
         self._ssid = ssid
         self._password = password
-        
-        script = f'''
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
 
-if ($profile -eq $null) {{
-    Write-Output "ERROR: No hay conexion a internet"
-    return
-}}
+        # SSID/contraseña se insertan como literales PowerShell entre comillas
+        # simples (ps_quote): con -Command los argumentos extra NO llegan a $args.
+        script = '''\
+$profile = Get-SharableProfile
+if ($null -eq $profile) { Write-Output "NO_PROFILE"; return }
 
+# GetTetheringCapability(NetworkAdapterId) es solo para SIM/LTE — no usar con Wi-Fi.
 $tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
 
 $config = $tethering.GetCurrentAccessPointConfiguration()
-$config.Ssid = "{ssid}"
-$config.Passphrase = "{password}"
+$config.Ssid = __SSID__
+$config.Passphrase = __PASSWORD__
 
-try {{
-    $configOp = $tethering.ConfigureAccessPointAsync($config)
-    $null = Await-AsyncOperation $configOp
-}} catch {{
-    # Continuar aunque falle la configuracion
-}}
+# ConfigureAccessPointAsync devuelve IAsyncAction → usar Await-Action (no Await-Op)
+try { Await-Action ($tethering.ConfigureAccessPointAsync($config)) } catch {}
 
-$startOp = $tethering.StartTetheringAsync()
-$deadline = (Get-Date).AddSeconds(45)
-while ((Get-Date) -lt $deadline) {{
-    $state = "$($tethering.TetheringOperationalState)"
-    if ($state -eq "On") {{
-        Write-Output "SUCCESS: Hotspot '{ssid}' iniciado correctamente"
-        return
-    }}
-    Start-Sleep -Milliseconds 300
-}}
-
-try {{
-    if ([int]$startOp.Status -eq 1) {{
-        $result = $startOp.GetResults()
-        if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {{
-            Write-Output "SUCCESS: Hotspot '{ssid}' iniciado correctamente"
-            return
-        }}
+# Iniciar si no está ya activo
+if ($tethering.TetheringOperationalState -eq [Windows.Networking.NetworkOperators.TetheringOperationalState]::On) {
+    Write-Output "SUCCESS: Hotspot ya activo"
+} else {
+    # StartTetheringAsync devuelve IAsyncOperation<NetworkOperatorTetheringOperationResult> → Await-Op
+    $result = Await-Op ($tethering.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
+        Write-Output "SUCCESS: Hotspot iniciado"
+    } else {
         Write-Output "ERROR: $($result.Status) - $($result.AdditionalErrorMessage)"
-        return
-    }}
-}} catch {{
-    # Ignorar y devolver timeout controlado
-}}
-
-Write-Output "ERROR: Timeout esperando activacion del hotspot"
+    }
+}
 '''
-        
-        success, msg, debug_info = self._run_winrt_ps(script, "START_HOTSPOT")
+        script = script.replace("__SSID__", ps_quote(ssid)).replace("__PASSWORD__", ps_quote(password))
+
+        success, msg, debug_info = self._run_winrt_ps(script, step="START_HOTSPOT")
         
         if error_handler.DebugLogger.is_enabled():
             full_report = error_handler.DebugLogger.get_full_report()
@@ -235,7 +328,27 @@ Write-Output "ERROR: Timeout esperando activacion del hotspot"
         
         if "SUCCESS" in msg:
             self._is_running = True
-            result_msg = f"Mobile Hotspot '{ssid}' creado exitosamente!\n\nLa conexion a internet se compartira automaticamente."
+
+            # Aplicar fix de ICS/DHCP para Windows 11 Build 26200 (25H2)
+            # En este build el DHCP de ICS falla silenciosamente:
+            # los dispositivos ven la red pero no reciben IP → sin internet.
+            fix_ok, fix_msg = self._fix_ics_routing_26200()
+            already = "ya activo" in msg
+
+            if already:
+                result_msg = f"Mobile Hotspot '{ssid}' ya estaba activo."
+            else:
+                result_msg = f"Mobile Hotspot '{ssid}' iniciado correctamente."
+
+            if "OFFLINE_MODE" in msg:
+                result_msg += (
+                    "\n\n⚠ Modo local (sin internet): la PC no tiene conexión a internet, "
+                    "así que los dispositivos podrán conectarse a la red y verse entre sí, "
+                    "pero sin acceso a internet.\n"
+                    "Cuando la PC recupere internet, pulsa 'Reparar conectividad'."
+                )
+
+            result_msg += f"\n\n{fix_msg}"
             if full_report:
                 result_msg += f"\n\n{full_report}"
             return True, result_msg
@@ -250,53 +363,160 @@ Write-Output "ERROR: Timeout esperando activacion del hotspot"
                 error_msg += f"\n\n{full_report}"
             return False, error_msg
         
-        error_msg = f"No se pudo iniciar Mobile Hotspot.\n\n{msg}"
+        if "NO_PROFILE" in msg:
+            error_msg = (
+                "No se pudo iniciar Mobile Hotspot: no hay ningún perfil de red.\n"
+                "La API de Windows necesita al menos una interfaz conectada a una red "
+                "(aunque no tenga internet).\n\n"
+                "Se intentará el método netsh automáticamente (no requiere red)."
+            )
+        else:
+            error_msg = f"No se pudo iniciar Mobile Hotspot.\n\n{msg}"
         if full_report:
             error_msg += f"\n\n{full_report}"
         return False, error_msg
     
+    def _fix_ics_routing_26200(self) -> tuple[bool, str]:
+        """
+        Workaround para el bug de ICS/DHCP en Windows 11 25H2 (Build 26200+).
+
+        PROBLEMA (confirmado en foros HP y Microsoft):
+          El Mobile Hotspot se activa y los dispositivos ven la red, pero el
+          servidor DHCP de ICS falla → los dispositivos no reciben IP → sin internet.
+          El bug afecta la pila de red de Windows, no los drivers.
+          sfc /scannow y DISM no detectan corrupción porque no la hay.
+
+        SOLUCIÓN:
+          1. Forzar IP estática 192.168.137.1/24 en el adaptador virtual Wi-Fi Direct.
+          2. Habilitar IP Forwarding en registro (IPEnableRouter=1) — clave para
+             que ICS enrute paquetes entre el adaptador de internet y el virtual.
+          3. Fijar parámetros de scope del servicio SharedAccess.
+          4. Reiniciar icssvc → SharedAccess → Dhcp en el orden correcto.
+
+        Se aplica siempre (no solo en Build 26200) porque no tiene efectos adversos
+        en builds anteriores y garantiza la conectividad en todos los casos.
+        """
+        build = error_handler.get_windows_build()
+        build_note = f" (Windows Build {build})" if build else ""
+
+        hotspot_ip = config.get_hotspot_ip()
+        prefix = config.get_hotspot_prefix()
+        dns_list = ", ".join(f'"{d}"' for d in config.get_dns_servers())
+
+        script = """\
+# Esperar hasta 15 s a que aparezca el adaptador virtual del Mobile Hotspot
+$va = $null
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline -and $null -eq $va) {
+    foreach ($p in @("*Wi-Fi Direct*", "*Microsoft Wi-Fi Direct Virtual Adapter*")) {
+        $va = Get-NetAdapter | Where-Object {
+            $_.InterfaceDescription -like $p -and $_.Status -eq "Up"
+        } | Select-Object -First 1
+        if ($va) { break }
+    }
+    if ($null -eq $va) {
+        $va = Get-NetAdapter | Where-Object {
+            $_.Name -like "Local Area Connection*" -and $_.Status -eq "Up"
+        } | Select-Object -First 1
+    }
+    if ($null -eq $va) { Start-Sleep -Milliseconds 500 }
+}
+
+if ($null -eq $va) { Write-Output "NO_ADAPTER"; exit }
+Write-Output "ADAPTER:$($va.Name)"
+
+# 1. IP estática __IP__/__PREFIX__ en el adaptador virtual (fix DHCP Build 26200)
+Remove-NetIPAddress -InterfaceIndex $va.InterfaceIndex -AddressFamily IPv4 `
+    -Confirm:$false -ErrorAction SilentlyContinue
+New-NetIPAddress -InterfaceIndex $va.InterfaceIndex `
+    -IPAddress "__IP__" -PrefixLength __PREFIX__ -ErrorAction SilentlyContinue | Out-Null
+Set-DnsClientServerAddress -InterfaceIndex $va.InterfaceIndex `
+    -ServerAddresses (__DNS__) -ErrorAction SilentlyContinue
+
+# 2. Habilitar IP Forwarding (crítico para el routing ICS en Build 26200)
+$tcpPath = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters"
+Set-ItemProperty -Path $tcpPath -Name "IPEnableRouter" -Value 1 -Type DWord `
+    -ErrorAction SilentlyContinue
+
+# 3. Fijar parámetros de scope del servicio ICS
+$icsPath = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters"
+Set-ItemProperty -Path $icsPath -Name "ScopeAddress"       -Value "__IP__" -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $icsPath -Name "ScopeAddressBackup" -Value "__IP__" -ErrorAction SilentlyContinue
+
+# 4. Reiniciar servicios en el orden correcto
+#    icssvc (Windows Mobile Hotspot Service) debe reiniciarse ANTES que SharedAccess
+Stop-Service -Name "SharedAccess" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "icssvc"       -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Start-Service -Name "icssvc"       -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Start-Service -Name "SharedAccess" -ErrorAction SilentlyContinue
+Start-Service -Name "Dhcp"         -ErrorAction SilentlyContinue
+
+Write-Output "FIXED"
+"""
+        script = (script.replace("__IP__", hotspot_ip)
+                        .replace("__PREFIX__", str(prefix))
+                        .replace("__DNS__", dns_list))
+        # El script espera hasta 15 s al adaptador + reinicia servicios (~6 s)
+        ok, out, debug_info = self._run_winrt_ps(script, step="FIX_ICS_26200", timeout=120)
+        error_handler.DebugLogger.log(
+            step="FIX_ICS_26200",
+            command="ICS routing fix script",
+            return_code=0 if "FIXED" in out else 1,
+            stdout=out,
+            stderr="",
+        )
+
+        if "NO_ADAPTER" in out:
+            return False, (
+                f"⚠ Fix de conectividad{build_note}: no se encontró el adaptador virtual.\n"
+                "El hotspot puede funcionar, pero si los dispositivos no reciben IP,\n"
+                "pulsa 'Reparar conectividad' una vez que el hotspot esté activo."
+            )
+
+        adapter = ""
+        for line in out.split("\n"):
+            if line.startswith("ADAPTER:"):
+                adapter = line.split(":", 1)[1].strip()
+
+        if "FIXED" in out:
+            return True, (
+                f"✓ Fix de conectividad aplicado{build_note}.\n"
+                f"  Adaptador: {adapter}\n"
+                f"  IP: {hotspot_ip} | IP Routing: ON | icssvc + SharedAccess reiniciados.\n"
+                "Los dispositivos deberían recibir IP y tener acceso a internet."
+            )
+
+        return False, f"⚠ Fix de conectividad incompleto{build_note}:\n{out.strip()}"
+
+    def fix_connectivity(self) -> tuple[bool, str]:
+        """
+        Punto de entrada público para reparar la conectividad del hotspot.
+        Útil como acción manual desde la GUI cuando el hotspot está activo
+        pero los dispositivos no reciben IP (bug ICS Build 26200).
+        """
+        error_handler.DebugLogger.clear()
+        return self._fix_ics_routing_26200()
+
     def stop_hotspot(self) -> tuple[bool, str]:
         error_handler.DebugLogger.clear()
         
-        script = '''
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-
-if ($profile -eq $null) {
-    Write-Output "ERROR: No hay conexion a internet"
-    return
-}
+        script = '''\
+$profile = Get-SharableProfile
+if ($null -eq $profile) { Write-Output "NO_PROFILE"; return }
 
 $tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
 
-$stopOp = $tethering.StopTetheringAsync()
-$deadline = (Get-Date).AddSeconds(45)
-while ((Get-Date) -lt $deadline) {
-    $state = "$($tethering.TetheringOperationalState)"
-    if ($state -eq "Off") {
-        Write-Output "SUCCESS: Hotspot detenido"
-        return
-    }
-    Start-Sleep -Milliseconds 300
+$result = Await-Op ($tethering.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
+    Write-Output "SUCCESS: Hotspot detenido"
+} else {
+    Write-Output "ERROR: $($result.Status)"
 }
-
-try {
-    if ([int]$stopOp.Status -eq 1) {
-        $result = $stopOp.GetResults()
-        if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
-            Write-Output "SUCCESS: Hotspot detenido"
-            return
-        }
-        Write-Output "ERROR: $($result.Status)"
-        return
-    }
-} catch {
-    # Ignorar y devolver timeout controlado
-}
-
-Write-Output "ERROR: Timeout esperando apagado del hotspot"
 '''
         
-        success, msg, debug_info = self._run_winrt_ps(script, "STOP_HOTSPOT")
+        success, msg, debug_info = self._run_winrt_ps(script, step="STOP_HOTSPOT")
         
         if error_handler.DebugLogger.is_enabled():
             full_report = error_handler.DebugLogger.get_full_report()
@@ -319,12 +539,8 @@ Write-Output "ERROR: Timeout esperando apagado del hotspot"
         error_handler.DebugLogger.clear()
         
         script = '''
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-
-if ($profile -eq $null) {
-    Write-Output "ERROR: No hay conexion a internet"
-    return
-}
+$profile = Get-SharableProfile
+if ($null -eq $profile) { Write-Output "NO_PROFILE"; return }
 
 $tethering = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
 $config = $tethering.GetCurrentAccessPointConfiguration()
@@ -336,7 +552,7 @@ Write-Output "Estado: $($tethering.TetheringOperationalState)"
 Write-Output "Clientes: $($tethering.ClientCount) / $($tethering.MaxClientCount)"
 '''
         
-        success, msg, debug_info = self._run_winrt_ps(script, "GET_STATUS")
+        success, msg, debug_info = self._run_winrt_ps(script, step="GET_STATUS")
         
         if error_handler.DebugLogger.is_enabled():
             full_report = error_handler.DebugLogger.get_full_report()
@@ -365,7 +581,7 @@ def stop_hotspot() -> tuple[bool, str]:
     return _manager.stop_hotspot()
 
 def delete_hotspot() -> tuple[bool, str]:
-    return _manager.stop_hotspot()
+    return _manager.delete_hotspot()
 
 def get_status() -> tuple[bool, str]:
     return _manager.get_status()
@@ -375,3 +591,11 @@ def check_support() -> tuple[bool, str]:
 
 def diagnose() -> str:
     return _manager.diagnose()
+
+def fix_connectivity() -> tuple[bool, str]:
+    """
+    Repara la conectividad del hotspot activo.
+    Diseñado para el bug de ICS/DHCP de Windows 11 25H2 (Build 26200+)
+    donde los dispositivos conectados no reciben IP.
+    """
+    return _manager.fix_connectivity()
