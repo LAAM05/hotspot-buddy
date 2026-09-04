@@ -7,6 +7,9 @@ import ctypes
 import datetime
 import socket
 
+# subprocess.CREATE_NO_WINDOW solo existe en Windows; en otros SO vale 0
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _is_admin() -> bool:
     try:
@@ -46,10 +49,16 @@ class DebugInfo:
 
 
 class DebugLogger:
-    # CORRECCIÓN: no usar mutable como default de clase.
-    # Se inicializa en la definición pero se reemplaza en clear() con una nueva lista.
+    # Thread-safe debug logger
     _enabled: ClassVar[bool] = False
     _logs: ClassVar[List[DebugInfo]] = []
+    _lock: ClassVar[Any] = None  # Will be initialized in _init_lock
+    
+    @classmethod
+    def _init_lock(cls):
+        if cls._lock is None:
+            import threading
+            cls._lock = threading.Lock()
     
     @classmethod
     def enable(cls):
@@ -65,12 +74,14 @@ class DebugLogger:
     
     @classmethod
     def log(cls, step: str, command: str, return_code: int, stdout: str, stderr: str) -> DebugInfo:
+        cls._init_lock()
         timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         success = return_code == 0
         info = DebugInfo(step, command, return_code, stdout, stderr, timestamp, success)
         
         if cls._enabled:
-            cls._logs.append(info)
+            with cls._lock:
+                cls._logs.append(info)
         
         return info
     
@@ -363,8 +374,9 @@ def diagnose_network() -> str:
         try:
             r = subprocess.run(
                 cmd, capture_output=True, text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=CREATE_NO_WINDOW,
                 encoding="utf-8", errors="ignore",
+                timeout=30,
             )
             return r.stdout.lower()
         except Exception:
@@ -428,7 +440,7 @@ def get_network_adapters() -> Dict[str, Any]:
             shell=True,
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW
         )
         
         for line in result.stdout.split('\n')[3:]:  # Saltar cabecera
@@ -473,40 +485,38 @@ def enable_ics(internet_adapter: str, hotspot_adapter: str) -> tuple[bool, str]:
     if not _is_admin():
         return False, "Se requieren permisos de administrador para habilitar ICS"
     
-    # Script PowerShell para habilitar ICS
+    # ICS se habilita con el objeto COM HNetCfg.HNetShare
+    # (INetSharingConfiguration.EnableSharing). Win32_NetworkAdapter no tiene
+    # ningún método EnableSharing — el enfoque WMI anterior fallaba siempre.
     ps_script = f'''
 $ErrorActionPreference = "Stop"
 
 try {{
-    # Obtener los adaptadores
-    $internetAdapter = Get-NetAdapter -Name "{internet_adapter}" -ErrorAction Stop
-    $hotspotAdapter = Get-NetAdapter -Name "{hotspot_adapter}" -ErrorAction Stop
-    
-    # Habilitar ICS usando registry (metodo mas confiable)
     $regPath = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters"
-    
-    # Configurar el adaptador compartido
-    $interfaceGuid = (Get-NetAdapter -Name "{internet_adapter}").InterfaceGuid
     Set-ItemProperty -Path $regPath -Name "ScopeAddress" -Value "192.168.137.1" -Force
     Set-ItemProperty -Path $regPath -Name "ScopeAddressBackup" -Value "192.168.137.1" -Force
-    
-    # Metodo alternativo: Usar NetConnection
-    $netConnInternet = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object {{ $_.Name -eq "{internet_adapter}" }}
-    $netConnHotspot = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object {{ $_.Name -eq "{hotspot_adapter}" }}
-    
-    if ($netConnInternet -and $netConnHotspot) {{
-        # Habilitar sharing mediante WMI
-        $netConnInternet | ForEach-Object {{
-            $_.EnableSharing($true)
-        }}
-        
+
+    $netShare = New-Object -ComObject HNetCfg.HNetShare
+    $publicCfg = $null
+    $privateCfg = $null
+    foreach ($conn in @($netShare.EnumEveryConnection)) {{
+        $props = $netShare.NetConnectionProps.Invoke($conn)
+        $cfg = $netShare.INetSharingConfigurationForINetConnection.Invoke($conn)
+        if ($props.Name -eq "{internet_adapter}") {{ $publicCfg = $cfg }}
+        if ($props.Name -eq "{hotspot_adapter}") {{ $privateCfg = $cfg }}
+        if ($cfg.SharingEnabled) {{ $cfg.DisableSharing() }}
+    }}
+
+    if ($publicCfg -and $privateCfg) {{
+        $publicCfg.EnableSharing(0)   # ICSSHARINGTYPE_PUBLIC
+        $privateCfg.EnableSharing(1)  # ICSSHARINGTYPE_PRIVATE
         Write-Output "SUCCESS: ICS habilitado correctamente"
         return
     }}
-    
+
     Write-Output "WARNING: No se pudo configurar ICS automaticamente"
     Write-Output "Configura manualmente: Panel de Control > Redes > Propiedades del adaptador > Compartir"
-    
+
 }} catch {{
     Write-Output "ERROR: $($_.Exception.Message)"
 }}
@@ -517,7 +527,7 @@ try {{
             ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW,
             timeout=30
         )
         
@@ -581,7 +591,7 @@ try {{
             ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW,
             timeout=15
         )
         
@@ -627,7 +637,7 @@ def reset_network_stack() -> tuple[bool, str]:
                 cmd,
                 capture_output=True,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=CREATE_NO_WINDOW,
                 timeout=30,
             )
             DebugLogger.log(

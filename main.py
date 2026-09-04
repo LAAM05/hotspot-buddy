@@ -14,6 +14,7 @@ import hotspot_powershell
 import hotspot_python
 import hotspot_mobile
 import error_handler
+from hotspot_base import HotspotBase
 
 # ─── Paleta de colores ────────────────────────────────────────────────────────
 BG        = "#0B0B12"   # Fondo raíz
@@ -38,7 +39,7 @@ YELLOW    = "#F59E0B"   # Advertencia
 YELLOW_D  = "#451A03"   # Fondo advertencia
 
 FONT      = "Segoe UI"
-MONO      = "Cascadia Code" if True else "Consolas"  # Fuente consola
+MONO      = "Cascadia Code"  # Fuente consola (Tk usa la fuente del sistema si no existe)
 
 
 # ─── Helpers de widget ────────────────────────────────────────────────────────
@@ -509,13 +510,20 @@ class HotspotApp:
                 "Abre manualmente: Configuración > Red e Internet > Zona de conexión móvil."
             )
 
-    def _get_manager(self):
+    def _get_manager(self) -> HotspotBase:
         method = self.current_method.get()
         if method == "powershell":
-            return hotspot_powershell
+            if not hasattr(self, '_powershell_manager') or self._powershell_manager is None:
+                self._powershell_manager = hotspot_powershell.PowerShellHotspot()
+            return self._powershell_manager
         elif method == "python":
-            return hotspot_python
-        return hotspot_mobile
+            if not hasattr(self, '_python_manager') or self._python_manager is None:
+                self._python_manager = hotspot_python.HotspotManager()
+            return self._python_manager
+        else:  # mobile
+            if not hasattr(self, '_mobile_manager') or self._mobile_manager is None:
+                self._mobile_manager = hotspot_mobile.WindowsMobileHotspot()
+            return self._mobile_manager
 
     def _get_method_description(self) -> str:
         method = self.current_method.get()
@@ -589,59 +597,78 @@ class HotspotApp:
 
     # ─── Acciones del hotspot ─────────────────────────────────────────────────
     def _check_support(self):
+        """Verifica compatibilidad en un hilo aparte para no congelar la UI
+        (las llamadas a PowerShell/netsh tardan varios segundos)."""
         if self.developer_mode.get():
             error_handler.DebugLogger.enable()
         manager = self._get_manager()
-        success, message = manager.check_support()
         method_desc = self._get_method_description()
-        if success:
-            build = error_handler.get_windows_build()
-            bug_note = ""
-            if error_handler.is_affected_by_ics_bug():
-                bug_note = (
-                    f"\n\n⚠  Windows Build {build} (25H2) — bug ICS/DHCP conocido.\n"
-                    "El hotspot se activa pero los dispositivos pueden no recibir IP.\n"
-                    "→  Usa 'Crear Hotspot' y luego 'Reparar conectividad' si no hay internet."
-                )
-            self._update_status(
-                f"Verificación de compatibilidad  [{method_desc}]\n\n{message}{bug_note}"
-            )
-            return
-        if self.current_method.get() == "mobile" and "ERROR_WINRT_BRIDGE" in message:
-            results = [f"Verificación [{method_desc}]\n\n{message}"]
-            for fb_val, fb_desc, fb_mgr in [
-                ("python",     "Python (netsh)",     hotspot_python),
-                ("powershell", "PowerShell (netsh)", hotspot_powershell),
-            ]:
-                ok, fb_msg = fb_mgr.check_support()
-                results.append(f"\n\nVerificación [{fb_desc}]\n\n{fb_msg}")
-                if ok:
-                    self.current_method.set(fb_val)
+        selected = self.current_method.get()
+        self._update_status(f"Verificando compatibilidad  [{method_desc}]...")
+
+        def worker():
+            new_method: str | None = None
+            new_method_desc = ""
+            success, message = manager.check_support()
+            if success:
+                build = error_handler.get_windows_build()
+                bug_note = ""
+                if error_handler.is_affected_by_ics_bug():
+                    bug_note = (
+                        f"\n\n⚠  Windows Build {build} (25H2) — bug ICS/DHCP conocido.\n"
+                        "El hotspot se activa pero los dispositivos pueden no recibir IP.\n"
+                        "→  Usa 'Crear Hotspot' y luego 'Reparar conectividad' si no hay internet."
+                    )
+                final = f"Verificación de compatibilidad  [{method_desc}]\n\n{message}{bug_note}"
+            elif selected == "mobile" and "ERROR_WINRT_BRIDGE" in message:
+                results = [f"Verificación [{method_desc}]\n\n{message}"]
+                for fb_val, fb_desc, fb_mgr in [
+                    ("python",     "Python (netsh)",     hotspot_python),
+                    ("powershell", "PowerShell (netsh)", hotspot_powershell),
+                ]:
+                    ok, fb_msg = fb_mgr.check_support()
+                    results.append(f"\n\nVerificación [{fb_desc}]\n\n{fb_msg}")
+                    if ok:
+                        new_method, new_method_desc = fb_val, fb_desc
+                        results.append(f"\n\n→  Método cambiado a [{fb_desc}] automáticamente.")
+                        break
+                final = "".join(results)
+            else:
+                final = f"Verificación [{method_desc}]\n\n{message}"
+
+            def apply():
+                if new_method:
+                    self.current_method.set(new_method)
                     self._update_method_pills()
-                    results.append(f"\n\n→  Método cambiado a [{fb_desc}] automáticamente.")
-                    break
-            self._update_status("".join(results))
-            return
-        self._update_status(f"Verificación [{method_desc}]\n\n{message}")
+                self._update_status(final)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _diagnose(self):
         manager = self._get_manager()
-        diagnosis = manager.diagnose()
-        if diagnosis:
-            msg = f"Diagnóstico del sistema:\n\n{diagnosis}"
-        else:
-            msg = (
-                "Diagnóstico del sistema:\n\n"
-                "✓  No se detectaron problemas obvios.\n\n"
-                "Si el hotspot no funciona:\n"
-                "  1.  Ejecuta como Administrador\n"
-                "  2.  Verifica que el WiFi esté encendido\n"
-                "  3.  Cierra VPNs y firewalls temporalmente\n"
-                "  4.  Usa 'Reparar conectividad' si el hotspot está activo pero sin internet"
-            )
-        if self.developer_mode.get():
-            msg += f"\n\n{error_handler.DebugLogger.get_full_report()}"
-        self._update_status(msg)
+        self._update_status("Ejecutando diagnóstico...")
+
+        def worker():
+            diagnosis = manager.diagnose()
+            if diagnosis:
+                msg = f"Diagnóstico del sistema:\n\n{diagnosis}"
+            else:
+                msg = (
+                    "Diagnóstico del sistema:\n\n"
+                    "✓  No se detectaron problemas obvios.\n\n"
+                    "Si el hotspot no funciona:\n"
+                    "  1.  Ejecuta como Administrador\n"
+                    "  2.  Verifica que el WiFi esté encendido\n"
+                    "  3.  Cierra VPNs y firewalls temporalmente\n"
+                    "  4.  Usa 'Reparar conectividad' si el hotspot está activo pero sin internet"
+                )
+            if self.developer_mode.get():
+                msg += f"\n\n{error_handler.DebugLogger.get_full_report()}"
+            self.root.after(0, lambda: self._update_status(msg))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _create_hotspot(self):
         ssid     = self.ssid_var.get().strip()
@@ -722,9 +749,15 @@ def _elevate_if_needed() -> None:
     try:
         is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
-        is_admin = False
+        # Fuera de Windows no hay UAC ni ctypes.windll
+        return
     if not is_admin:
-        params = " ".join(f'"{a}"' for a in sys.argv)
+        if getattr(sys, "frozen", False):
+            # PyInstaller: sys.executable ES el .exe; no repetirlo como argumento
+            args = sys.argv[1:]
+        else:
+            args = sys.argv
+        params = " ".join(f'"{a}"' for a in args)
         ret = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, params, None, 1
         )

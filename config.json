@@ -1,0 +1,17 @@
+{
+  "hotspot": {
+    "ip_address": "192.168.137.1",
+    "prefix_length": 24,
+    "dns_servers": ["8.8.8.8", "8.8.4.4"],
+    "timeout_seconds": 30
+  },
+  "validation": {
+    "ssid_min_length": 1,
+    "ssid_max_length": 32,
+    "password_min_length": 8,
+    "password_max_length": 63
+  },
+  "debug": {
+    "enabled_by_default": false
+  }
+}
