@@ -3,6 +3,10 @@ import ctypes
 import re
 from typing import Optional
 import error_handler
+from hotspot_base import HotspotBase
+
+# subprocess.CREATE_NO_WINDOW solo existe en Windows; en otros SO vale 0
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def is_admin() -> bool:
     try:
@@ -17,9 +21,10 @@ def run_command(cmd: list, step: str = "") -> tuple[int, str, str, error_handler
             cmd,
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW,
             encoding="utf-8",
             errors="ignore",
+            timeout=60,
         )
         debug_info = error_handler.DebugLogger.log(
             step=step,
@@ -39,7 +44,7 @@ def run_command(cmd: list, step: str = "") -> tuple[int, str, str, error_handler
         )
         return -1, "", str(exc), debug_info
 
-class HotspotManager:
+class HotspotManager(HotspotBase):
     def __init__(self):
         self._ssid: Optional[str] = None
         self._password: Optional[str] = None
@@ -143,83 +148,61 @@ o manualmente: Configuración > Red > Zona de conexión móvil
         if not hotspot_adapter:
             return False, "No se encontro adaptador del hotspot. Inicia el hotspot primero."
         
-        # Script PowerShell robusto para habilitar ICS
+        # ICS real se habilita con el objeto COM HNetCfg.HNetShare
+        # (INetSharingConfiguration.EnableSharing). Win32_NetworkAdapter NO
+        # tiene ningún método EnableSharing — el enfoque WMI anterior nunca
+        # compartía nada y reportaba éxito falso.
         ps_script = f'''
 $ErrorActionPreference = "Continue"
 
 try {{
-    # Obtener adaptadores
-    $internetAdapter = Get-NetAdapter -Name "{internet_adapter}" -ErrorAction SilentlyContinue
-    $hotspotAdapter = Get-NetAdapter -Name "{hotspot_adapter}" -ErrorAction SilentlyContinue
-    
-    if (-not $internetAdapter) {{
-        Write-Output "ERROR: No se encontro el adaptador de internet: {internet_adapter}"
-        return
-    }}
-    
-    if (-not $hotspotAdapter) {{
-        Write-Output "ERROR: No se encontro el adaptador del hotspot: {hotspot_adapter}"
-        return
-    }}
-    
-    # Obtener GUIDs
-    $internetGuid = $internetAdapter.InterfaceGuid
-    $hotspotGuid = $hotspotAdapter.InterfaceGuid
-    
-    # Configurar registry para ICS
     $regPath = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters"
-    
-    # Backup de configuracion actual
-    $backupValue = Get-ItemProperty -Path $regPath -Name "ScopeAddressBackup" -ErrorAction SilentlyContinue
-    if (-not $backupValue) {{
-        Set-ItemProperty -Path $regPath -Name "ScopeAddressBackup" -Value "192.168.137.1" -Force
+    Set-ItemProperty -Path $regPath -Name "ScopeAddress"       -Value "192.168.137.1" -Force
+    Set-ItemProperty -Path $regPath -Name "ScopeAddressBackup" -Value "192.168.137.1" -Force
+
+    $hotspotAdapter = Get-NetAdapter -Name "{hotspot_adapter}" -ErrorAction SilentlyContinue
+    if ($hotspotAdapter) {{
+        New-NetIPAddress -InterfaceIndex $hotspotAdapter.ifIndex -IPAddress "192.168.137.1" -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null
+        Set-DnsClientServerAddress -InterfaceIndex $hotspotAdapter.ifIndex -ServerAddresses ("8.8.8.8", "8.8.4.4") -ErrorAction SilentlyContinue
     }}
-    
-    # Configurar direccion del gateway
-    Set-ItemProperty -Path $regPath -Name "ScopeAddress" -Value "192.168.137.1" -Force
-    
-    # Configurar IP estatica en el adaptador del hotspot
-    New-NetIPAddress -InterfaceIndex $hotspotAdapter.ifIndex -IPAddress "192.168.137.1" -PrefixLength 24 -ErrorAction SilentlyContinue
-    
-    # Habilitar DNS forwarding
-    Set-DnsClientServerAddress -InterfaceIndex $hotspotAdapter.ifIndex -ServerAddresses ("8.8.8.8", "8.8.4.4") -ErrorAction SilentlyContinue
-    
-    # Intentar habilitar sharing via WMI (metodo mas confiable)
-    $sharingFound = $false
-    $adapters = Get-WmiObject -Class Win32_NetworkAdapterConfiguration | Where-Object {{ $_.IPEnabled -eq $true }}
-    
-    foreach ($adapter in $adapters) {{
-        if ($adapter.ServiceName -eq $internetAdapter.ServiceName) {{
-            # Este es el adaptador con internet
-            $sharingFound = $true
-            break
-        }}
+
+    $netShare = New-Object -ComObject HNetCfg.HNetShare
+    $connections = @($netShare.EnumEveryConnection)
+
+    $publicCfg = $null
+    $privateCfg = $null
+    foreach ($conn in $connections) {{
+        $props = $netShare.NetConnectionProps.Invoke($conn)
+        $cfg = $netShare.INetSharingConfigurationForINetConnection.Invoke($conn)
+        if ($props.Name -eq "{internet_adapter}") {{ $publicCfg = $cfg }}
+        if ($props.Name -eq "{hotspot_adapter}") {{ $privateCfg = $cfg }}
+        # Deshabilitar sharing previo para evitar conflictos
+        if ($cfg.SharingEnabled) {{ $cfg.DisableSharing() }}
     }}
-    
-    if ($sharingFound) {{
-        Write-Output "SUCCESS: ICS configurado correctamente"
-        Write-Output "InternetAdapter: {internet_adapter}"
-        Write-Output "HotspotAdapter: {hotspot_adapter}"
-        Write-Output "Gateway: 192.168.137.1"
-        Write-Output "DNS: 8.8.8.8, 8.8.4.4"
-    }} else {{
-        Write-Output "WARNING: No se pudo verificar completamente ICS"
-        Write-Output "Configura manualmente si es necesario"
-    }}
-    
+
+    if ($null -eq $publicCfg)  {{ Write-Output "ERROR: No se encontro el adaptador de internet: {internet_adapter}"; return }}
+    if ($null -eq $privateCfg) {{ Write-Output "ERROR: No se encontro el adaptador del hotspot: {hotspot_adapter}"; return }}
+
+    $publicCfg.EnableSharing(0)   # ICSSHARINGTYPE_PUBLIC
+    $privateCfg.EnableSharing(1)  # ICSSHARINGTYPE_PRIVATE
+
+    Write-Output "SUCCESS: ICS configurado correctamente"
+    Write-Output "InternetAdapter: {internet_adapter}"
+    Write-Output "HotspotAdapter: {hotspot_adapter}"
+    Write-Output "Gateway: 192.168.137.1"
 }} catch {{
     Write-Output "ERROR: $($_.Exception.Message)"
     Write-Output "Configura manualmente: Panel de Control > Redes > Propiedades > Compartir"
 }}
 '''
-        
+
         try:
             result = subprocess.run(
                 ["powershell", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
                 capture_output=True,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                timeout=30,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=60,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -265,10 +248,10 @@ try {{
         if not valid_pwd:
             return False, pwd_msg
         
-        # Verificar conexion a internet antes de continuar
-        if not error_handler.has_internet_connection():
-            return False, "ADVERTENCIA: No hay conexion a internet en la computadora.\nEl hotspot se creara pero los dispositivos NO tendran acceso a internet.\n\nConecta la computadora a internet e intenta de nuevo."
-        
+        # Sin internet NO se bloquea la creación (modo Connectify): el hotspot
+        # se crea en modo local y los dispositivos se ven entre sí sin WAN.
+        offline = not error_handler.has_internet_connection()
+
         self._ssid = ssid
         self._password = password
         
@@ -288,16 +271,21 @@ try {{
         
         if code == 0:
             self._is_running = True
-            
-            # Intentar habilitar internet sharing automaticamente
-            sharing_success, sharing_msg = self._enable_internet_sharing()
-            
+
             base_msg = f"Hotspot '{ssid}' creado exitosamente."
-            if sharing_success:
-                base_msg += f"\n\n{sharing_msg}"
+            if offline:
+                # Sin WAN no tiene sentido configurar ICS: red local solamente
+                base_msg += (
+                    "\n\n⚠ Modo local (sin internet): la PC no tiene conexión a internet, "
+                    "así que los dispositivos podrán conectarse a la red y verse entre sí, "
+                    "pero sin acceso a internet.\n"
+                    "Cuando la PC recupere internet, recrea el hotspot para compartirla."
+                )
             else:
+                # Intentar habilitar internet sharing automaticamente
+                _, sharing_msg = self._enable_internet_sharing()
                 base_msg += f"\n\n{sharing_msg}"
-            
+
             if error_handler.DebugLogger.is_enabled():
                 return True, f"{base_msg}\n\n{error_handler.DebugLogger.get_full_report()}"
             return True, base_msg
@@ -403,8 +391,9 @@ SOLUCIONES ALTERNATIVAS:
         if error_handler.DebugLogger.is_enabled():
             error_msg += f"\n{error_handler.DebugLogger.get_full_report()}"
         return False, error_msg
-        
-        return False, "No se pudo determinar la compatibilidad."
+
+    def diagnose(self) -> str:
+        return error_handler.diagnose_network()
 
 _manager = HotspotManager()
 

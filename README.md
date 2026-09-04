@@ -52,6 +52,15 @@ MyHotspot/
 > La mayoria de adaptadores Realtek modernos reportan `Hosted network supported: No`.
 > En ese caso el unico metodo funcional es Mobile Hotspot.
 
+## Modo local sin internet (estilo Connectify)
+
+El hotspot se puede crear **aunque la PC no tenga conexion a internet**:
+
+- Los dispositivos se conectan a la red y se ven entre si (compartir archivos, juegos LAN, etc.), pero sin acceso a internet.
+- Con el metodo Mobile Hotspot, si no hay perfil de internet se usa cualquier perfil de red disponible; sin ningun perfil de red la app cae automaticamente al metodo netsh.
+- Con el metodo netsh, la configuracion de ICS se omite cuando no hay WAN (no tiene sentido compartir lo que no existe) y se muestra una advertencia.
+- Al recuperar internet: pulsa **"Reparar conectividad"** (metodo Mobile) o recrea el hotspot (metodo netsh).
+
 ## Bug de ICS/DHCP en Windows 11 25H2 (Build 26200+)
 
 **Sintoma:** el hotspot se activa y los dispositivos ven la red, pero no reciben IP → sin internet.
@@ -88,7 +97,8 @@ def fix_connectivity() -> tuple[bool, str]   # hotspot_mobile unicamente
 |-------|-------|----------|
 | `Hosted network supported: No` | Driver no soporta netsh | Usar metodo **Mobile Hotspot** |
 | `Access is denied` | Sin privilegios | La app pide UAC automaticamente; si falla, ejecutar como admin |
-| `No hay conexion a internet` | Sin acceso WAN | Conectarse a internet antes de crear el hotspot |
+| Dispositivos conectados sin internet | La PC no tiene WAN (modo local) | El hotspot funciona en red local; al recuperar internet usa **"Reparar conectividad"** o recrea el hotspot |
+| `No se encontró ningún perfil de red` | Ninguna interfaz conectada a red alguna (solo método Mobile) | La app cae automaticamente al metodo netsh, que no lo requiere |
 | Dispositivos se conectan pero sin internet | Bug ICS Build 26200 | Pulsar **"Reparar conectividad"** |
 | `Element not found / MobileBroadbandAccount` | Error antiguo ya corregido | Actualizar a la version actual |
 
